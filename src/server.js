@@ -9,6 +9,7 @@ const usuariosRoutes = require('./routes/usuarios.routes');
 const vendasRoutes = require('./routes/vendas.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
 const filiaisRoutes = require('./routes/filiais.routes');
+const contasReceberRoutes = require('./routes/contas-receber.routes');
 const app = express();
 
 app.use(cors());
@@ -18,6 +19,7 @@ app.use('/auth', authRoutes);
 app.use('/filiais', filiaisRoutes);
 app.use('/usuarios', usuariosRoutes);
 app.use('/vendas', vendasRoutes);
+app.use('/contas-receber', contasReceberRoutes);
 app.use('/dashboard', dashboardRoutes);
 
 app.get('/', async (req, res) => {

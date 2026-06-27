@@ -6,6 +6,120 @@ const router = express.Router();
 
 router.use(authMiddleware);
 
+function normalizarSituacao(situacao) {
+  return situacao || 'Em processo';
+}
+
+function montarFiltroEscopo(req, params, alias = 'v') {
+  const where = [];
+  const prefixo = alias ? `${alias}.` : '';
+
+  if (req.user.perfil === 'corretor') {
+    params.push(req.user.id);
+    const idx = params.length;
+
+    where.push(`
+      (
+        ${prefixo}corretor_id = $${idx}
+        OR EXISTS (
+          SELECT 1
+          FROM venda_corretores vc_escopo
+          WHERE vc_escopo.venda_id = ${prefixo}id
+            AND vc_escopo.corretor_id = $${idx}
+        )
+      )
+    `);
+  }
+
+  if (req.user.perfil === 'gerente') {
+    params.push(req.user.id);
+    const idx = params.length;
+
+    where.push(`
+      (
+        EXISTS (
+          SELECT 1
+          FROM usuarios c_escopo
+          WHERE c_escopo.id = ${prefixo}corretor_id
+            AND c_escopo.gerente_id = $${idx}
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM venda_corretores vc_escopo
+          INNER JOIN usuarios c_escopo ON c_escopo.id = vc_escopo.corretor_id
+          WHERE vc_escopo.venda_id = ${prefixo}id
+            AND c_escopo.gerente_id = $${idx}
+        )
+      )
+    `);
+  }
+
+  return where;
+}
+
+async function vendaPertenceAoEscopo(req, vendaId) {
+  if (req.user.perfil === 'admin') {
+    return true;
+  }
+
+  const params = [vendaId];
+  const where = [`v.id = $1`];
+  where.push(...montarFiltroEscopo(req, params, 'v'));
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM vendas v
+    WHERE ${where.join(' AND ')}
+    LIMIT 1
+    `,
+    params
+  );
+
+  return result.rows.length > 0;
+}
+
+async function validarCorretoresParaUsuario(req, corretores = []) {
+  const ids = corretores
+    .map(item => item?.corretorId)
+    .filter(Boolean)
+    .map(String);
+
+  if (!ids.length) {
+    return {
+      ok: true
+    };
+  }
+
+  if (req.user.perfil === 'admin') {
+    return {
+      ok: true
+    };
+  }
+
+  const result = await pool.query(
+    `
+    SELECT id
+    FROM usuarios
+    WHERE perfil = 'corretor'
+      AND gerente_id = $1
+      AND id = ANY($2::uuid[])
+    `,
+    [req.user.id, ids]
+  );
+
+  if (result.rows.length !== ids.length) {
+    return {
+      ok: false,
+      message: 'Gerente só pode movimentar vendas de corretores da própria equipe'
+    };
+  }
+
+  return {
+    ok: true
+  };
+}
+
 async function salvarCorretoresVenda(vendaId, corretores = []) {
   await pool.query(
     `
@@ -164,10 +278,65 @@ async function recalcularStatusComissaoVendaGeral(vendaId) {
   );
 }
 
-function mapVenda(row) {
+function mapVenda(row, req) {
+  const isCorretor = req?.user?.perfil === 'corretor';
+
+  if (isCorretor) {
+    return {
+      id: row.id,
+      situacao: normalizarSituacao(row.situacao),
+
+      cliente: row.cliente,
+      cpfCliente: row.cpf_cliente,
+      empreendimentoRua: row.empreendimento_rua,
+      numeroUnidade: row.numero_unidade,
+
+      corretorId: row.usuario_corretor_id || row.corretor_id,
+      corretor: row.usuario_corretor_nome || row.corretor_nome || 'Corretor',
+
+      corretor2Id: null,
+      corretor2: '',
+      valorRepasseCorretor2: 0,
+
+      captacao: '',
+      valorCaptacao: 0,
+
+      valorComissaoTotal: Number(row.valor_repasse_usuario || 0),
+
+      nota: '',
+      valorNota: 0,
+
+      assinaturaCcv: row.assinatura_ccv,
+
+      fechador: '',
+      valorFechador: 0,
+
+      irFuturo: row.ir_futuro,
+
+      valorImovelVenda: Number(row.valor_imovel_venda || 0),
+      modalidadeImovel: row.modalidade_imovel,
+
+      valorRepasseCorretor: Number(row.valor_repasse_usuario || 0),
+      valorRepasseGerencia: 0,
+      valorRepasseImobiliaria: 0,
+
+      valorPagoComprovantes: Number(row.valor_pago_usuario || 0),
+      saldoPendente: Number(row.saldo_pendente_usuario || 0),
+
+      documentacaoValorCliente: 0,
+      documentacaoValorSobra: 0,
+
+      statusComissaoCorretor: row.status_pagamento_usuario || row.status_comissao_corretor,
+      dataPagamentoComissao: row.data_pagamento_comissao,
+
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
   return {
     id: row.id,
-    situacao: row.situacao,
+    situacao: normalizarSituacao(row.situacao),
 
     cliente: row.cliente,
     cpfCliente: row.cpf_cliente,
@@ -232,17 +401,7 @@ router.get('/', async (req, res) => {
     const params = [];
     const where = [];
 
-    if (req.user.perfil === 'corretor') {
-      params.push(req.user.id);
-      where.push(`
-        EXISTS (
-          SELECT 1
-          FROM venda_corretores vc
-          WHERE vc.venda_id = v.id
-            AND vc.corretor_id = $${params.length}
-        )
-      `);
-    }
+    where.push(...montarFiltroEscopo(req, params, 'v'));
 
     if (corretorId && ['admin', 'gerente'].includes(req.user.perfil)) {
       params.push(corretorId);
@@ -271,7 +430,9 @@ router.get('/', async (req, res) => {
     }
 
     if (situacao) {
-      params.push(situacao);
+      const situacaoNormalizada = normalizarSituacao(situacao);
+      params.push(situacaoNormalizada);
+
       where.push(`v.situacao = $${params.length}`);
     }
 
@@ -295,12 +456,21 @@ router.get('/', async (req, res) => {
       where.push(`EXTRACT(MONTH FROM v.assinatura_ccv) = $${params.length}`);
     }
 
+    const usuarioParamIndex = params.length + 1;
+    const queryParams = [...params, req.user.id];
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
     const result = await pool.query(
       `
       SELECT
         v.*,
+
+        pu.corretor_id AS usuario_corretor_id,
+        pu.corretor_nome AS usuario_corretor_nome,
+        COALESCE(pu.valor_repasse, 0)::NUMERIC AS valor_repasse_usuario,
+        COALESCE(pu.valor_pago, 0)::NUMERIC AS valor_pago_usuario,
+        COALESCE(pu.saldo_pendente, 0)::NUMERIC AS saldo_pendente_usuario,
+        pu.status_pagamento AS status_pagamento_usuario,
 
         COALESCE((
           SELECT SUM(c.valor)
@@ -313,18 +483,67 @@ router.get('/', async (req, res) => {
             SELECT SUM(c.valor)
             FROM usuarios_comprovantes c
             WHERE c.venda_id = v.id
+              AND EXISTS (
+                SELECT 1
+                FROM usuarios u
+                WHERE u.id = COALESCE(c.usuario_id, c.corretor_id)
+                  AND u.perfil = 'corretor'
+              )
           ), 0),
           0
         )::NUMERIC AS saldo_pendente
 
       FROM vendas v
+      LEFT JOIN LATERAL (
+        SELECT
+          vc.corretor_id,
+          vc.corretor_nome,
+          vc.valor_repasse,
+          vc.valor_pago,
+          vc.saldo_pendente,
+          vc.status_pagamento
+        FROM venda_corretores vc
+        WHERE vc.venda_id = v.id
+          AND vc.corretor_id = $${usuarioParamIndex}
+
+        UNION ALL
+
+        SELECT
+          v.corretor_id,
+          v.corretor_nome,
+          COALESCE(v.valor_repasse_corretor, 0)::NUMERIC,
+          COALESCE((
+            SELECT SUM(c.valor)
+            FROM usuarios_comprovantes c
+            WHERE c.venda_id = v.id
+              AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+          ), 0)::NUMERIC,
+          GREATEST(
+            COALESCE(v.valor_repasse_corretor, 0) - COALESCE((
+              SELECT SUM(c.valor)
+              FROM usuarios_comprovantes c
+              WHERE c.venda_id = v.id
+                AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+            ), 0),
+            0
+          )::NUMERIC,
+          v.status_comissao_corretor
+        WHERE v.corretor_id = $${usuarioParamIndex}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM venda_corretores vc2
+            WHERE vc2.venda_id = v.id
+              AND vc2.corretor_id = $${usuarioParamIndex}
+          )
+        LIMIT 1
+      ) pu ON TRUE
       ${whereSql}
       ORDER BY v.assinatura_ccv DESC NULLS LAST, v.created_at DESC
       `,
-      params
+      queryParams
     );
 
-    return res.json(result.rows.map(mapVenda));
+    return res.json(result.rows.map(row => mapVenda(row, req)));
   } catch (error) {
     console.error(error);
 
@@ -338,17 +557,30 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
-
     const body = req.body;
 
     if (!body.cliente) {
-      await client.query('ROLLBACK');
-
       return res.status(400).json({
         message: 'Cliente é obrigatório'
       });
     }
+
+    const permissaoCorretores = await validarCorretoresParaUsuario(req, [
+      {
+        corretorId: body.corretorId
+      },
+      {
+        corretorId: body.corretor2Id
+      }
+    ]);
+
+    if (!permissaoCorretores.ok) {
+      return res.status(403).json({
+        message: permissaoCorretores.message
+      });
+    }
+
+    await client.query('BEGIN');
 
     const result = await client.query(
       `
@@ -399,7 +631,7 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
         body.corretor2Id || null,
         body.corretor2 || null,
         body.valorRepasseCorretor2 || 0,
-        body.situacao || 'Em processo',
+        normalizarSituacao(body.situacao),
         body.captacao || 'Não',
         body.valorCaptacao || 0,
         body.valorComissaoTotal || 0,
@@ -440,29 +672,15 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
       `
       SELECT
         v.*,
-
-        COALESCE((
-          SELECT SUM(c.valor)
-          FROM usuarios_comprovantes c
-          WHERE c.venda_id = v.id
-        ), 0)::NUMERIC AS valor_pago_comprovantes,
-
-        GREATEST(
-          COALESCE(v.valor_repasse_corretor, 0) - COALESCE((
-            SELECT SUM(c.valor)
-            FROM usuarios_comprovantes c
-            WHERE c.venda_id = v.id
-          ), 0),
-          0
-        )::NUMERIC AS saldo_pendente
-
+        0::NUMERIC AS valor_pago_comprovantes,
+        0::NUMERIC AS saldo_pendente
       FROM vendas v
       WHERE v.id = $1
       `,
       [vendaCriada.id]
     );
 
-    return res.status(201).json(mapVenda(vendaAtualizadaResult.rows[0]));
+    return res.status(201).json(mapVenda(vendaAtualizadaResult.rows[0], req));
   } catch (error) {
     await client.query('ROLLBACK');
 
@@ -480,10 +698,33 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
-
     const { id } = req.params;
     const body = req.body;
+
+    const pertence = await vendaPertenceAoEscopo(req, id);
+
+    if (!pertence) {
+      return res.status(403).json({
+        message: 'Você não tem permissão para editar esta venda'
+      });
+    }
+
+    const permissaoCorretores = await validarCorretoresParaUsuario(req, [
+      {
+        corretorId: body.corretorId
+      },
+      {
+        corretorId: body.corretor2Id
+      }
+    ]);
+
+    if (!permissaoCorretores.ok) {
+      return res.status(403).json({
+        message: permissaoCorretores.message
+      });
+    }
+
+    await client.query('BEGIN');
 
     const result = await client.query(
       `
@@ -529,7 +770,7 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
         body.corretor2Id || null,
         body.corretor2 || null,
         body.valorRepasseCorretor2 || 0,
-        body.situacao || 'Em processo',
+        normalizarSituacao(body.situacao),
         body.captacao || 'Não',
         body.valorCaptacao || 0,
         body.valorComissaoTotal || 0,
@@ -576,29 +817,19 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
       `
       SELECT
         v.*,
-
         COALESCE((
           SELECT SUM(c.valor)
           FROM usuarios_comprovantes c
           WHERE c.venda_id = v.id
         ), 0)::NUMERIC AS valor_pago_comprovantes,
-
-        GREATEST(
-          COALESCE(v.valor_repasse_corretor, 0) - COALESCE((
-            SELECT SUM(c.valor)
-            FROM usuarios_comprovantes c
-            WHERE c.venda_id = v.id
-          ), 0),
-          0
-        )::NUMERIC AS saldo_pendente
-
+        0::NUMERIC AS saldo_pendente
       FROM vendas v
       WHERE v.id = $1
       `,
       [id]
     );
 
-    return res.json(mapVenda(vendaAtualizadaResult.rows[0]));
+    return res.json(mapVenda(vendaAtualizadaResult.rows[0], req));
   } catch (error) {
     await client.query('ROLLBACK');
 
@@ -615,20 +846,11 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
 router.patch('/:id/pagar-comissao', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
     const { id } = req.params;
+    const pertence = await vendaPertenceAoEscopo(req, id);
 
-    const vendaResult = await pool.query(
-      `
-      SELECT *
-      FROM vendas
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [id]
-    );
-
-    if (!vendaResult.rows.length) {
-      return res.status(404).json({
-        message: 'Venda não encontrada'
+    if (!pertence) {
+      return res.status(403).json({
+        message: 'Você não tem permissão para lançar pagamento nesta venda'
       });
     }
 
@@ -644,7 +866,7 @@ router.patch('/:id/pagar-comissao', somentePerfis('admin', 'gerente'), async (re
   }
 });
 
-router.delete('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
+router.delete('/:id', somentePerfis('admin'), async (req, res) => {
   try {
     const { id } = req.params;
 

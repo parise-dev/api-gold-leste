@@ -98,16 +98,62 @@ function mapUsuario(row) {
   };
 }
 
-function podeVisualizarUsuario(req, usuarioId) {
+async function podeVisualizarUsuario(req, usuarioId) {
   if (req.user.perfil === 'admin') {
     return true;
   }
 
-  if (req.user.perfil === 'gerente') {
+  if (String(req.user.id) === String(usuarioId)) {
     return true;
   }
 
-  return String(req.user.id) === String(usuarioId);
+  if (req.user.perfil === 'gerente') {
+    const result = await pool.query(
+      `
+      SELECT 1
+      FROM usuarios
+      WHERE id = $1
+        AND perfil = 'corretor'
+        AND gerente_id = $2
+      LIMIT 1
+      `,
+      [usuarioId, req.user.id]
+    );
+
+    return result.rows.length > 0;
+  }
+
+  return false;
+}
+
+async function usuarioPertenceAoGerente(usuarioId, gerenteId) {
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM usuarios
+    WHERE id = $1
+      AND perfil = 'corretor'
+      AND gerente_id = $2
+    LIMIT 1
+    `,
+    [usuarioId, gerenteId]
+  );
+
+  return result.rows.length > 0;
+}
+
+async function buscarFilialUsuario(usuarioId) {
+  const result = await pool.query(
+    `
+    SELECT filial_id
+    FROM usuarios
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+
+  return result.rows[0]?.filial_id || null;
 }
 
 function somenteAdmin(req, res) {
@@ -218,16 +264,32 @@ async function corretorPertenceVenda(vendaId, usuarioId) {
   const result = await pool.query(
     `
     SELECT 1
-    FROM venda_corretores
-    WHERE venda_id = $1
-      AND corretor_id = $2
+    FROM venda_corretores vc
+    WHERE vc.venda_id = $1
+      AND vc.corretor_id = $2
 
     UNION
 
     SELECT 1
-    FROM vendas
-    WHERE id = $1
-      AND corretor_id = $2
+    FROM vendas v
+    WHERE v.id = $1
+      AND v.corretor_id = $2
+
+    UNION
+
+    SELECT 1
+    FROM vendas v
+    INNER JOIN usuarios c ON c.id = v.corretor_id
+    WHERE v.id = $1
+      AND c.gerente_id = $2
+
+    UNION
+
+    SELECT 1
+    FROM venda_corretores vc
+    INNER JOIN usuarios c ON c.id = vc.corretor_id
+    WHERE vc.venda_id = $1
+      AND c.gerente_id = $2
 
     LIMIT 1
     `,
@@ -239,6 +301,22 @@ async function corretorPertenceVenda(vendaId, usuarioId) {
 
 async function recalcularStatusComissaoVendaCorretor(vendaId, usuarioId) {
   if (!vendaId || !usuarioId) {
+    return;
+  }
+
+  const usuarioResult = await pool.query(
+    `
+    SELECT perfil
+    FROM usuarios
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+
+  const perfilUsuario = usuarioResult.rows[0]?.perfil || '';
+
+  if (perfilUsuario === 'gerente') {
     return;
   }
 
@@ -353,6 +431,18 @@ async function recalcularStatusComissaoVendaGeral(vendaId) {
 
 router.get('/', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
+    const params = [];
+    let where = '';
+
+    if (req.user.perfil === 'gerente') {
+      params.push(req.user.id);
+
+      where = `
+        WHERE u.perfil = 'corretor'
+          AND u.gerente_id = $1
+      `;
+    }
+
     const result = await pool.query(
       `
       SELECT
@@ -377,8 +467,10 @@ router.get('/', somentePerfis('admin', 'gerente'), async (req, res) => {
       FROM usuarios u
       LEFT JOIN filiais f ON f.id = u.filial_id
       LEFT JOIN usuarios g ON g.id = u.gerente_id
+      ${where}
       ORDER BY u.nome ASC
-      `
+      `,
+      params
     );
 
     return res.json(result.rows.map(mapUsuario));
@@ -393,14 +485,25 @@ router.get('/', somentePerfis('admin', 'gerente'), async (req, res) => {
 
 router.get('/gerentes', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
+    const params = [];
+    let where = `
+      WHERE perfil = 'gerente'
+        AND ativo = TRUE
+    `;
+
+    if (req.user.perfil === 'gerente') {
+      params.push(req.user.id);
+      where += ` AND id = $1`;
+    }
+
     const result = await pool.query(
       `
       SELECT id, nome, email
       FROM usuarios
-      WHERE perfil = 'gerente'
-        AND ativo = TRUE
+      ${where}
       ORDER BY nome ASC
-      `
+      `,
+      params
     );
 
     return res.json(result.rows.map(row => ({
@@ -420,17 +523,41 @@ router.get('/gerentes', somentePerfis('admin', 'gerente'), async (req, res) => {
 
 router.get('/corretores', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
+    const params = [];
+    let whereGerente = '';
+
+    if (req.user.perfil === 'gerente') {
+      params.push(req.user.id);
+      whereGerente = `AND u.gerente_id = $${params.length}`;
+    }
+
     const result = await pool.query(
       `
-      SELECT id, nome, email
-      FROM usuarios
-      WHERE perfil = 'corretor'
-      AND ativo = TRUE
-      ORDER BY nome ASC
-      `
+      SELECT
+        u.id,
+        u.nome,
+        u.email,
+        u.gerente_id,
+        g.nome AS gerente_nome
+      FROM usuarios u
+      LEFT JOIN usuarios g ON g.id = u.gerente_id
+      WHERE u.perfil = 'corretor'
+        AND u.ativo = TRUE
+        ${whereGerente}
+      ORDER BY u.nome ASC
+      `,
+      params
     );
 
-    return res.json(result.rows);
+    return res.json(result.rows.map(row => ({
+      id: row.id,
+      nome: row.nome,
+      name: row.nome,
+      email: row.email,
+      gerenteId: row.gerente_id,
+      managerId: row.gerente_id,
+      gerenteNome: row.gerente_nome
+    })));
   } catch (error) {
     console.error(error);
 
@@ -440,11 +567,11 @@ router.get('/corretores', somentePerfis('admin', 'gerente'), async (req, res) =>
   }
 });
 
-router.post('/', somentePerfis('admin'), async (req, res) => {
+router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
     const nome = req.body.nome || req.body.name;
     const email = req.body.email;
-    const perfil = req.body.perfil || req.body.cargo;
+    const perfilBody = req.body.perfil || req.body.cargo;
 
     const cpf = req.body.cpf || null;
     const creci = req.body.creci || null;
@@ -452,8 +579,9 @@ router.post('/', somentePerfis('admin'), async (req, res) => {
     const dataAdmissao = req.body.dataAdmissao || req.body.admissionDate || null;
     const endereco = req.body.endereco || req.body.address || null;
 
-    const filialId = req.body.filialId || req.body.filial || null;
-    const gerenteId = req.body.gerenteId || req.body.managerId || null;
+    let perfilFinal = perfilBody;
+    let filialIdFinal = req.body.filialId || req.body.filial || null;
+    let gerenteIdFinal = req.body.gerenteId || req.body.managerId || null;
 
     const ativo = typeof req.body.ativo === 'boolean'
       ? req.body.ativo
@@ -461,19 +589,31 @@ router.post('/', somentePerfis('admin'), async (req, res) => {
         ? !req.body.hidden
         : true;
 
-    if (!nome || !email || !perfil) {
+    if (req.user.perfil === 'gerente') {
+      if (perfilBody && perfilBody !== 'corretor') {
+        return res.status(403).json({
+          message: 'Gerente só pode criar usuários corretores'
+        });
+      }
+
+      perfilFinal = 'corretor';
+      gerenteIdFinal = req.user.id;
+      filialIdFinal = await buscarFilialUsuario(req.user.id);
+    }
+
+    if (!nome || !email || !perfilFinal) {
       return res.status(400).json({
         message: 'Nome completo, e-mail e cargo são obrigatórios'
       });
     }
 
-    if (!['admin', 'gerente', 'corretor'].includes(perfil)) {
+    if (!['admin', 'gerente', 'corretor'].includes(perfilFinal)) {
       return res.status(400).json({
         message: 'Cargo inválido'
       });
     }
 
-    if (filialId) {
+    if (filialIdFinal) {
       const filialResult = await pool.query(
         `
         SELECT id
@@ -482,7 +622,7 @@ router.post('/', somentePerfis('admin'), async (req, res) => {
           AND ativo = TRUE
         LIMIT 1
         `,
-        [filialId]
+        [filialIdFinal]
       );
 
       if (!filialResult.rows.length) {
@@ -492,7 +632,7 @@ router.post('/', somentePerfis('admin'), async (req, res) => {
       }
     }
 
-    if (gerenteId) {
+    if (gerenteIdFinal) {
       const gerenteResult = await pool.query(
         `
         SELECT id
@@ -502,7 +642,7 @@ router.post('/', somentePerfis('admin'), async (req, res) => {
           AND ativo = TRUE
         LIMIT 1
         `,
-        [gerenteId]
+        [gerenteIdFinal]
       );
 
       if (!gerenteResult.rows.length) {
@@ -558,18 +698,18 @@ router.post('/', somentePerfis('admin'), async (req, res) => {
         updated_at
       `,
       [
-        nome,
-        email,
+        String(nome).trim(),
+        String(email).trim(),
         senhaHash,
-        perfil,
+        perfilFinal,
         ativo,
         cpf,
         creci,
         telefone,
         dataAdmissao,
         endereco,
-        filialId || null,
-        gerenteId || null
+        filialIdFinal || null,
+        gerenteIdFinal || null
       ]
     );
 
@@ -592,13 +732,23 @@ router.post('/', somentePerfis('admin'), async (req, res) => {
   }
 });
 
-router.put('/:id', somentePerfis('admin'), async (req, res) => {
+router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
     const { id } = req.params;
 
+    if (req.user.perfil === 'gerente') {
+      const pertence = await usuarioPertenceAoGerente(id, req.user.id);
+
+      if (!pertence) {
+        return res.status(403).json({
+          message: 'Você só pode editar corretores da sua equipe'
+        });
+      }
+    }
+
     const nome = req.body.nome || req.body.name;
     const email = req.body.email;
-    const perfil = req.body.perfil || req.body.cargo;
+    const perfilBody = req.body.perfil || req.body.cargo;
 
     const cpf = req.body.cpf || null;
     const creci = req.body.creci || null;
@@ -606,8 +756,9 @@ router.put('/:id', somentePerfis('admin'), async (req, res) => {
     const dataAdmissao = req.body.dataAdmissao || req.body.admissionDate || null;
     const endereco = req.body.endereco || req.body.address || null;
 
-    const filialId = req.body.filialId || req.body.filial || null;
-    const gerenteId = req.body.gerenteId || req.body.managerId || null;
+    let perfilFinal = perfilBody;
+    let filialIdFinal = req.body.filialId || req.body.filial || null;
+    let gerenteIdFinal = req.body.gerenteId || req.body.managerId || null;
 
     const ativo = typeof req.body.ativo === 'boolean'
       ? req.body.ativo
@@ -615,19 +766,31 @@ router.put('/:id', somentePerfis('admin'), async (req, res) => {
         ? !req.body.hidden
         : true;
 
-    if (!nome || !email || !perfil) {
+    if (req.user.perfil === 'gerente') {
+      if (perfilBody && perfilBody !== 'corretor') {
+        return res.status(403).json({
+          message: 'Gerente só pode editar usuários corretores'
+        });
+      }
+
+      perfilFinal = 'corretor';
+      gerenteIdFinal = req.user.id;
+      filialIdFinal = await buscarFilialUsuario(req.user.id);
+    }
+
+    if (!nome || !email || !perfilFinal) {
       return res.status(400).json({
         message: 'Nome completo, e-mail e cargo são obrigatórios'
       });
     }
 
-    if (!['admin', 'gerente', 'corretor'].includes(perfil)) {
+    if (!['admin', 'gerente', 'corretor'].includes(perfilFinal)) {
       return res.status(400).json({
         message: 'Cargo inválido'
       });
     }
 
-    if (filialId) {
+    if (filialIdFinal) {
       const filialResult = await pool.query(
         `
         SELECT id
@@ -636,7 +799,7 @@ router.put('/:id', somentePerfis('admin'), async (req, res) => {
           AND ativo = TRUE
         LIMIT 1
         `,
-        [filialId]
+        [filialIdFinal]
       );
 
       if (!filialResult.rows.length) {
@@ -646,7 +809,7 @@ router.put('/:id', somentePerfis('admin'), async (req, res) => {
       }
     }
 
-    if (gerenteId) {
+    if (gerenteIdFinal) {
       const gerenteResult = await pool.query(
         `
         SELECT id
@@ -656,7 +819,7 @@ router.put('/:id', somentePerfis('admin'), async (req, res) => {
           AND ativo = TRUE
         LIMIT 1
         `,
-        [gerenteId]
+        [gerenteIdFinal]
       );
 
       if (!gerenteResult.rows.length) {
@@ -702,17 +865,17 @@ router.put('/:id', somentePerfis('admin'), async (req, res) => {
         updated_at
       `,
       [
-        nome,
-        email,
-        perfil,
+        String(nome).trim(),
+        String(email).trim(),
+        perfilFinal,
         ativo,
         cpf,
         creci,
         telefone,
         dataAdmissao,
         endereco,
-        filialId || null,
-        gerenteId || null,
+        filialIdFinal || null,
+        gerenteIdFinal || null,
         id
       ]
     );
@@ -739,9 +902,19 @@ router.put('/:id', somentePerfis('admin'), async (req, res) => {
   }
 });
 
-router.patch('/:id/resetar-senha', somentePerfis('admin'), async (req, res) => {
+router.patch('/:id/resetar-senha', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
     const { id } = req.params;
+
+    if (req.user.perfil === 'gerente') {
+      const pertence = await usuarioPertenceAoGerente(id, req.user.id);
+
+      if (!pertence) {
+        return res.status(403).json({
+          message: 'Você só pode resetar senha de corretores da sua equipe'
+        });
+      }
+    }
 
     const senhaHash = await bcrypt.hash(SENHA_PADRAO, 10);
 
@@ -804,7 +977,7 @@ router.get('/:id/perfil', async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!podeVisualizarUsuario(req, id)) {
+    if (!(await podeVisualizarUsuario(req, id))) {
       return res.status(403).json({
         message: 'Você não tem permissão para visualizar este usuário'
       });
@@ -855,53 +1028,53 @@ router.get('/:id/perfil', async (req, res) => {
     }
 
     const resumoResult = await pool.query(
-  `
-  SELECT
-    COUNT(DISTINCT v.id)::INT AS total_vendas,
+      `
+      SELECT
+        COUNT(DISTINCT v.id)::INT AS total_vendas,
 
-    COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'Concluído' OR v.situacao = 'Concluido')::INT AS total_concluidas,
-    COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'Em processo')::INT AS total_em_processo,
-    COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'IR Futuro')::INT AS total_ir_futuro,
-    COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'Caiu')::INT AS total_caiu,
+        COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'Concluído' OR v.situacao = 'Concluido')::INT AS total_concluidas,
+        COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'Em processo')::INT AS total_em_processo,
+        COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'IR Futuro')::INT AS total_ir_futuro,
+        COUNT(DISTINCT v.id) FILTER (WHERE v.situacao = 'Caiu')::INT AS total_caiu,
 
-    COALESCE(SUM(v.valor_imovel_venda), 0)::NUMERIC AS total_vendido,
-    COALESCE(SUM(v.valor_comissao_total), 0)::NUMERIC AS total_comissao,
-    COALESCE(SUM(vc.valor_repasse), 0)::NUMERIC AS total_repasse,
+        COALESCE(SUM(v.valor_imovel_venda), 0)::NUMERIC AS total_vendido,
+        COALESCE(SUM(v.valor_comissao_total), 0)::NUMERIC AS total_comissao,
+        COALESCE(SUM(vc.valor_repasse), 0)::NUMERIC AS total_repasse,
 
-    COALESCE(SUM(vc.saldo_pendente), 0)::NUMERIC AS comissao_a_receber,
-    COALESCE(SUM(vc.valor_pago), 0)::NUMERIC AS comissao_paga
-  FROM venda_corretores vc
-  INNER JOIN vendas v ON v.id = vc.venda_id
-  WHERE vc.corretor_id = $1
-  `,
-  [id]
-);
+        COALESCE(SUM(vc.saldo_pendente), 0)::NUMERIC AS comissao_a_receber,
+        COALESCE(SUM(vc.valor_pago), 0)::NUMERIC AS comissao_paga
+      FROM venda_corretores vc
+      INNER JOIN vendas v ON v.id = vc.venda_id
+      WHERE vc.corretor_id = $1
+      `,
+      [id]
+    );
 
     const vendasRecentesResult = await pool.query(
-  `
-  SELECT
-    v.id,
-    v.cliente,
-    v.cpf_cliente,
-    v.empreendimento_rua,
-    v.numero_unidade,
-    v.situacao,
-    v.assinatura_ccv,
-    v.valor_imovel_venda,
-    v.valor_comissao_total,
-    vc.valor_repasse AS valor_repasse_corretor,
-    vc.valor_pago AS valor_pago_comprovantes,
-    vc.saldo_pendente,
-    vc.status_pagamento AS status_comissao_corretor,
-    v.created_at
-  FROM venda_corretores vc
-  INNER JOIN vendas v ON v.id = vc.venda_id
-  WHERE vc.corretor_id = $1
-  ORDER BY v.assinatura_ccv DESC NULLS LAST, v.created_at DESC
-  LIMIT 8
-  `,
-  [id]
-);
+      `
+      SELECT
+        v.id,
+        v.cliente,
+        v.cpf_cliente,
+        v.empreendimento_rua,
+        v.numero_unidade,
+        v.situacao,
+        v.assinatura_ccv,
+        v.valor_imovel_venda,
+        v.valor_comissao_total,
+        vc.valor_repasse AS valor_repasse_corretor,
+        vc.valor_pago AS valor_pago_comprovantes,
+        vc.saldo_pendente,
+        vc.status_pagamento AS status_comissao_corretor,
+        v.created_at
+      FROM venda_corretores vc
+      INNER JOIN vendas v ON v.id = vc.venda_id
+      WHERE vc.corretor_id = $1
+      ORDER BY v.assinatura_ccv DESC NULLS LAST, v.created_at DESC
+      LIMIT 8
+      `,
+      [id]
+    );
 
     const comprovantesRecentesResult = await pool.query(
       `
@@ -975,23 +1148,21 @@ router.get('/:id/perfil', async (req, res) => {
       },
 
       vendasRecentes: vendasRecentesResult.rows.map(row => ({
-  id: row.id,
-  cliente: row.cliente,
-  cpfCliente: row.cpf_cliente,
-  empreendimentoRua: row.empreendimento_rua,
-  numeroUnidade: row.numero_unidade,
-  situacao: row.situacao,
-  assinaturaCcv: row.assinatura_ccv,
-  valorImovelVenda: Number(row.valor_imovel_venda || 0),
-  valorComissaoTotal: Number(row.valor_comissao_total || 0),
-  valorRepasseCorretor: Number(row.valor_repasse_corretor || 0),
-
-  valorPagoComprovantes: Number(row.valor_pago_comprovantes || 0),
-  saldoPendente: Number(row.saldo_pendente || 0),
-  criadoEm: row.created_at,
-
-  statusComissaoCorretor: row.status_comissao_corretor
-})),
+        id: row.id,
+        cliente: row.cliente,
+        cpfCliente: row.cpf_cliente,
+        empreendimentoRua: row.empreendimento_rua,
+        numeroUnidade: row.numero_unidade,
+        situacao: row.situacao,
+        assinaturaCcv: row.assinatura_ccv,
+        valorImovelVenda: Number(row.valor_imovel_venda || 0),
+        valorComissaoTotal: Number(row.valor_comissao_total || 0),
+        valorRepasseCorretor: Number(row.valor_repasse_corretor || 0),
+        valorPagoComprovantes: Number(row.valor_pago_comprovantes || 0),
+        saldoPendente: Number(row.saldo_pendente || 0),
+        criadoEm: row.created_at,
+        statusComissaoCorretor: row.status_comissao_corretor
+      })),
 
       comprovantesRecentes: comprovantesRecentesResult.rows.map(row => ({
         id: row.id,
@@ -1021,63 +1192,63 @@ router.get('/:id/vendas', async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!podeVisualizarUsuario(req, id)) {
+    if (!(await podeVisualizarUsuario(req, id))) {
       return res.status(403).json({
         message: 'Você não tem permissão para visualizar vendas deste usuário'
       });
     }
 
     const result = await pool.query(
-  `
-  SELECT
-    v.id,
-    v.cliente,
-    v.cpf_cliente,
-    v.empreendimento_rua,
-    v.numero_unidade,
-    v.situacao,
-    v.assinatura_ccv,
-    v.valor_imovel_venda,
-    v.valor_comissao_total,
-    vc.valor_repasse AS valor_repasse_corretor,
-    v.valor_repasse_gerencia,
-    v.valor_repasse_imobiliaria,
-    v.modalidade_imovel,
-    vc.status_pagamento AS status_comissao_corretor,
-    v.data_pagamento_comissao,
-    v.created_at,
+      `
+      SELECT
+        v.id,
+        v.cliente,
+        v.cpf_cliente,
+        v.empreendimento_rua,
+        v.numero_unidade,
+        v.situacao,
+        v.assinatura_ccv,
+        v.valor_imovel_venda,
+        v.valor_comissao_total,
+        vc.valor_repasse AS valor_repasse_corretor,
+        v.valor_repasse_gerencia,
+        v.valor_repasse_imobiliaria,
+        v.modalidade_imovel,
+        vc.status_pagamento AS status_comissao_corretor,
+        v.data_pagamento_comissao,
+        v.created_at,
 
-    COALESCE(vc.valor_pago, 0)::NUMERIC AS valor_pago_comprovantes,
-    COALESCE(vc.saldo_pendente, vc.valor_repasse, 0)::NUMERIC AS saldo_pendente
+        COALESCE(vc.valor_pago, 0)::NUMERIC AS valor_pago_comprovantes,
+        COALESCE(vc.saldo_pendente, vc.valor_repasse, 0)::NUMERIC AS saldo_pendente
 
-  FROM venda_corretores vc
-  INNER JOIN vendas v ON v.id = vc.venda_id
-  WHERE vc.corretor_id = $1
-  ORDER BY v.assinatura_ccv DESC NULLS LAST, v.created_at DESC
-  `,
-  [id]
-);
+      FROM venda_corretores vc
+      INNER JOIN vendas v ON v.id = vc.venda_id
+      WHERE vc.corretor_id = $1
+      ORDER BY v.assinatura_ccv DESC NULLS LAST, v.created_at DESC
+      `,
+      [id]
+    );
 
-   return res.json(result.rows.map(row => ({
-  id: row.id,
-  cliente: row.cliente,
-  cpfCliente: row.cpf_cliente,
-  empreendimentoRua: row.empreendimento_rua,
-  numeroUnidade: row.numero_unidade,
-  situacao: row.situacao,
-  assinaturaCcv: row.assinatura_ccv,
-  valorImovelVenda: Number(row.valor_imovel_venda || 0),
-  valorComissaoTotal: Number(row.valor_comissao_total || 0),
-  valorRepasseCorretor: Number(row.valor_repasse_corretor || 0),
-  valorRepasseGerencia: Number(row.valor_repasse_gerencia || 0),
-  valorRepasseImobiliaria: Number(row.valor_repasse_imobiliaria || 0),
-  valorPagoComprovantes: Number(row.valor_pago_comprovantes || 0),
-  saldoPendente: Number(row.saldo_pendente || 0),
-  modalidadeImovel: row.modalidade_imovel,
-  statusComissaoCorretor: row.status_comissao_corretor,
-  dataPagamentoComissao: row.data_pagamento_comissao,
-  criadoEm: row.created_at
-})));
+    return res.json(result.rows.map(row => ({
+      id: row.id,
+      cliente: row.cliente,
+      cpfCliente: row.cpf_cliente,
+      empreendimentoRua: row.empreendimento_rua,
+      numeroUnidade: row.numero_unidade,
+      situacao: row.situacao,
+      assinaturaCcv: row.assinatura_ccv,
+      valorImovelVenda: Number(row.valor_imovel_venda || 0),
+      valorComissaoTotal: Number(row.valor_comissao_total || 0),
+      valorRepasseCorretor: Number(row.valor_repasse_corretor || 0),
+      valorRepasseGerencia: Number(row.valor_repasse_gerencia || 0),
+      valorRepasseImobiliaria: Number(row.valor_repasse_imobiliaria || 0),
+      valorPagoComprovantes: Number(row.valor_pago_comprovantes || 0),
+      saldoPendente: Number(row.saldo_pendente || 0),
+      modalidadeImovel: row.modalidade_imovel,
+      statusComissaoCorretor: row.status_comissao_corretor,
+      dataPagamentoComissao: row.data_pagamento_comissao,
+      criadoEm: row.created_at
+    })));
   } catch (error) {
     console.error(error);
 
@@ -1091,7 +1262,7 @@ router.get('/:id/comprovantes', async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!podeVisualizarUsuario(req, id)) {
+    if (!(await podeVisualizarUsuario(req, id))) {
       return res.status(403).json({
         message: 'Você não tem permissão para visualizar comprovantes deste usuário'
       });
@@ -1169,7 +1340,7 @@ router.post('/:id/comprovantes', uploadComprovante.single('arquivo'), async (req
   try {
     const { id } = req.params;
 
-    if (!podeVisualizarUsuario(req, id)) {
+    if (!(await podeVisualizarUsuario(req, id))) {
       return res.status(403).json({
         message: 'Você não tem permissão para lançar pagamento para este usuário'
       });
@@ -1356,6 +1527,86 @@ router.patch('/:id/dados-bancarios', async (req, res) => {
   }
 });
 
+router.delete('/:id/comprovantes/:comprovanteId/documento', async (req, res) => {
+  try {
+    const { id, comprovanteId } = req.params;
+
+    const comprovanteResult = await pool.query(
+      `
+      SELECT
+        id,
+        usuario_id,
+        corretor_id,
+        criado_por,
+        arquivo_url
+      FROM usuarios_comprovantes
+      WHERE id = $1
+        AND (
+          usuario_id = $2
+          OR corretor_id = $2
+        )
+      LIMIT 1
+      `,
+      [comprovanteId, id]
+    );
+
+    if (!comprovanteResult.rows.length) {
+      return res.status(404).json({
+        message: 'Pagamento não encontrado'
+      });
+    }
+
+    const comprovante = comprovanteResult.rows[0];
+
+    const podeAlterar =
+      req.user.perfil === 'admin' ||
+      req.user.perfil === 'gerente' ||
+      String(comprovante.criado_por) === String(req.user.id);
+
+    if (!podeAlterar) {
+      return res.status(403).json({
+        message: 'Você não tem permissão para remover este comprovante'
+      });
+    }
+
+    if (comprovante.arquivo_url) {
+      const caminhoAntigo = path.join(
+        __dirname,
+        '..',
+        '..',
+        comprovante.arquivo_url.replace(/^\/+/, '')
+      );
+
+      if (fs.existsSync(caminhoAntigo)) {
+        fs.unlinkSync(caminhoAntigo);
+      }
+    }
+
+    await pool.query(
+      `
+      UPDATE usuarios_comprovantes
+      SET
+        arquivo_nome = NULL,
+        arquivo_url = NULL,
+        arquivo_mime = NULL,
+        arquivo_tamanho = NULL
+      WHERE id = $1
+      `,
+      [comprovanteId]
+    );
+
+    return res.json({
+      message: 'Comprovante removido com sucesso'
+    });
+  } catch (error) {
+    console.error(error);
+
+    return res.status(500).json({
+      message: 'Erro ao remover comprovante'
+    });
+  }
+});
+
 router.delete('/:id/comprovantes/:comprovanteId', async (req, res) => {
   try {
     const { id, comprovanteId } = req.params;
@@ -1417,11 +1668,11 @@ router.delete('/:id/comprovantes/:comprovanteId', async (req, res) => {
     }
 
     if (comprovante.venda_id) {
-  await recalcularStatusComissaoVendaCorretor(
-    comprovante.venda_id,
-    comprovante.usuario_id
-  );
-}
+      await recalcularStatusComissaoVendaCorretor(
+        comprovante.venda_id,
+        comprovante.usuario_id
+      );
+    }
 
     return res.json({
       message: 'Comprovante excluído com sucesso'
@@ -1439,7 +1690,7 @@ router.get('/:id/vendas/:vendaId/pagamentos', async (req, res) => {
   try {
     const { id, vendaId } = req.params;
 
-    if (!podeVisualizarUsuario(req, id)) {
+    if (!(await podeVisualizarUsuario(req, id))) {
       return res.status(403).json({
         message: 'Você não tem permissão para visualizar pagamentos deste usuário'
       });
@@ -1454,40 +1705,40 @@ router.get('/:id/vendas/:vendaId/pagamentos', async (req, res) => {
     }
 
     const result = await pool.query(
-  `
-  SELECT
-    c.id,
-    c.usuario_id,
-    c.corretor_id,
-    c.venda_id,
-    c.tipo,
-    c.descricao,
-    c.valor,
-    c.data_pagamento,
-    c.arquivo_nome,
-    c.arquivo_url,
-    c.arquivo_mime,
-    c.arquivo_tamanho,
-    c.criado_em,
-    c.criado_por,
+      `
+      SELECT
+        c.id,
+        c.usuario_id,
+        c.corretor_id,
+        c.venda_id,
+        c.tipo,
+        c.descricao,
+        c.valor,
+        c.data_pagamento,
+        c.arquivo_nome,
+        c.arquivo_url,
+        c.arquivo_mime,
+        c.arquivo_tamanho,
+        c.criado_em,
+        c.criado_por,
 
-    recebedor.nome AS corretor_nome,
-    u.nome AS criado_por_nome
+        recebedor.nome AS corretor_nome,
+        u.nome AS criado_por_nome
 
-  FROM usuarios_comprovantes c
-  LEFT JOIN usuarios recebedor ON recebedor.id = COALESCE(c.corretor_id, c.usuario_id)
-  LEFT JOIN usuarios u ON u.id = c.criado_por
+      FROM usuarios_comprovantes c
+      LEFT JOIN usuarios recebedor ON recebedor.id = COALESCE(c.corretor_id, c.usuario_id)
+      LEFT JOIN usuarios u ON u.id = c.criado_por
 
-  WHERE c.venda_id = $1
-    AND (
-      c.usuario_id = $2
-      OR c.corretor_id = $2
-    )
+      WHERE c.venda_id = $1
+        AND (
+          c.usuario_id = $2
+          OR c.corretor_id = $2
+        )
 
-  ORDER BY c.data_pagamento DESC NULLS LAST, c.criado_em DESC
-  `,
-  [vendaId, id]
-);
+      ORDER BY c.data_pagamento DESC NULLS LAST, c.criado_em DESC
+      `,
+      [vendaId, id]
+    );
 
     return res.json(result.rows.map(row => ({
       id: row.id,
