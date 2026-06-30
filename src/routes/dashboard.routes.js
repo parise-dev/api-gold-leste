@@ -6,50 +6,12 @@ const router = express.Router();
 
 router.use(authMiddleware);
 
-function montarFiltrosDashboard(req, alias = '') {
+function montarFiltrosPeriodo(req, alias = '') {
   const params = [];
   const where = [];
 
   const prefixo = alias ? `${alias}.` : '';
   const dataBase = `COALESCE(${prefixo}assinatura_ccv, ${prefixo}created_at)::date`;
-
-  if (req.user.perfil === 'corretor') {
-    params.push(req.user.id);
-
-    where.push(`
-      (
-        ${prefixo}corretor_id = $${params.length}
-        OR EXISTS (
-          SELECT 1
-          FROM venda_corretores vc
-          WHERE vc.venda_id = ${prefixo}id
-            AND vc.corretor_id = $${params.length}
-        )
-      )
-    `);
-  }
-
-  if (req.user.perfil === 'gerente') {
-    params.push(req.user.id);
-
-    where.push(`
-      (
-        EXISTS (
-          SELECT 1
-          FROM usuarios c
-          WHERE c.id = ${prefixo}corretor_id
-            AND c.gerente_id = $${params.length}
-        )
-        OR EXISTS (
-          SELECT 1
-          FROM venda_corretores vc
-          INNER JOIN usuarios c ON c.id = vc.corretor_id
-          WHERE vc.venda_id = ${prefixo}id
-            AND c.gerente_id = $${params.length}
-        )
-      )
-    `);
-  }
 
   const periodo = req.query.periodo || 'mesAtual';
   const dataInicio = req.query.dataInicio;
@@ -83,6 +45,66 @@ function montarFiltrosDashboard(req, alias = '') {
     where.push(`${dataBase} <= $${params.length}`);
   }
 
+  return { params, where };
+}
+
+function montarFiltrosDashboard(req, alias = '') {
+  const { params, where } = montarFiltrosPeriodo(req, alias);
+
+  const prefixo = alias ? `${alias}.` : '';
+
+  if (req.user.perfil === 'corretor') {
+    params.push(req.user.id);
+    const idx = params.length;
+
+    where.push(`
+      (
+        ${prefixo}corretor_id = $${idx}
+        OR ${prefixo}corretor_2_id = $${idx}
+        OR ${prefixo}captador_id = $${idx}
+        OR EXISTS (
+          SELECT 1
+          FROM venda_corretores vc
+          WHERE vc.venda_id = ${prefixo}id
+            AND vc.corretor_id = $${idx}
+        )
+      )
+    `);
+  }
+
+  if (req.user.perfil === 'gerente') {
+    params.push(req.user.id);
+    const idx = params.length;
+
+    where.push(`
+      (
+        ${prefixo}created_by = $${idx}
+        OR ${prefixo}updated_by = $${idx}
+        OR EXISTS (
+          SELECT 1
+          FROM usuarios c
+          WHERE c.id IN (${prefixo}corretor_id, ${prefixo}corretor_2_id, ${prefixo}captador_id)
+            AND c.gerente_id = $${idx}
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM venda_corretores vc
+          INNER JOIN usuarios c ON c.id = vc.corretor_id
+          WHERE vc.venda_id = ${prefixo}id
+            AND c.gerente_id = $${idx}
+        )
+      )
+    `);
+  }
+
+  return {
+    params,
+    whereSql: where.length ? `WHERE ${where.join(' AND ')}` : ''
+  };
+}
+
+function wherePeriodoSql(req, alias = 'v') {
+  const { params, where } = montarFiltrosPeriodo(req, alias);
   return {
     params,
     whereSql: where.length ? `WHERE ${where.join(' AND ')}` : ''
@@ -92,7 +114,6 @@ function montarFiltrosDashboard(req, alias = '') {
 router.get('/resumo', async (req, res) => {
   try {
     const { params, whereSql } = montarFiltrosDashboard(req, 'v');
-
     const usuarioParamIndex = params.length + 1;
     const queryParams = [...params, req.user.id];
 
@@ -104,7 +125,7 @@ router.get('/resumo', async (req, res) => {
         ${whereSql}
       ),
 
-      participantes AS (
+      vendedores AS (
         SELECT
           vc.venda_id,
           vc.corretor_id,
@@ -128,21 +149,33 @@ router.get('/resumo', async (req, res) => {
           )
       ),
 
-      corretores_por_venda AS (
+      captacoes AS (
         SELECT
-          p.venda_id,
+          vb.id AS venda_id,
+          vb.captador_id AS corretor_id,
+          COALESCE(vb.valor_captacao, 0)::NUMERIC AS valor_repasse
+        FROM vendas_base vb
+        WHERE vb.captacao = 'Sim'
+          AND vb.captador_id IS NOT NULL
+          AND COALESCE(vb.valor_captacao, 0) > 0
+      ),
 
-          COALESCE(SUM(p.valor_repasse), 0)::NUMERIC AS total_repasse_corretores,
+      repasses_usuario AS (
+        SELECT venda_id, corretor_id, valor_repasse, 'venda' AS tipo FROM vendedores
+        UNION ALL
+        SELECT venda_id, corretor_id, valor_repasse, 'captacao' AS tipo FROM captacoes
+      ),
 
-          COALESCE(
-            SUM(p.valor_repasse) FILTER (
-              WHERE p.corretor_id = $${usuarioParamIndex}
-            ),
-            0
-          )::NUMERIC AS repasse_usuario
-
-        FROM participantes p
-        GROUP BY p.venda_id
+      repasses_por_venda AS (
+        SELECT
+          r.venda_id,
+          COALESCE(SUM(r.valor_repasse), 0)::NUMERIC AS total_repasse_corretores_e_captacao,
+          COALESCE(SUM(r.valor_repasse) FILTER (WHERE r.tipo = 'captacao'), 0)::NUMERIC AS total_repasse_captacao,
+          COALESCE(SUM(r.valor_repasse) FILTER (WHERE r.corretor_id = $${usuarioParamIndex}), 0)::NUMERIC AS repasse_usuario,
+          BOOL_OR(r.tipo = 'venda' AND r.corretor_id = $${usuarioParamIndex}) AS usuario_vendeu,
+          BOOL_OR(r.tipo = 'captacao' AND r.corretor_id = $${usuarioParamIndex}) AS usuario_captou
+        FROM repasses_usuario r
+        GROUP BY r.venda_id
       ),
 
       pagamentos_usuario AS (
@@ -189,29 +222,25 @@ router.get('/resumo', async (req, res) => {
       )
 
       SELECT
-        COUNT(vb.id)::INT AS total_vendas,
+        COUNT(vb.id)::INT AS total_vendas_geral,
+        COUNT(vb.id) FILTER (WHERE COALESCE(rpv.usuario_vendeu, false))::INT AS total_vendas_usuario,
 
+        COUNT(vb.id) FILTER (WHERE vb.situacao = 'Concluído' OR vb.situacao = 'Concluido')::INT AS total_concluidas_geral,
         COUNT(vb.id) FILTER (
-          WHERE vb.situacao = 'Concluído' OR vb.situacao = 'Concluido'
-        )::INT AS total_concluidas,
+          WHERE (vb.situacao = 'Concluído' OR vb.situacao = 'Concluido')
+            AND COALESCE(rpv.usuario_vendeu, false)
+        )::INT AS total_concluidas_usuario,
 
-        COUNT(vb.id) FILTER (
-          WHERE vb.situacao = 'Em processo'
-        )::INT AS total_em_processo,
-
-        COUNT(vb.id) FILTER (
-          WHERE vb.situacao = 'IR Futuro'
-        )::INT AS total_ir_futuro,
-
-        COUNT(vb.id) FILTER (
-          WHERE vb.situacao = 'Distrato'
-        )::INT AS total_distrato,
+        COUNT(vb.id) FILTER (WHERE vb.situacao = 'Em processo')::INT AS total_em_processo_geral,
+        COUNT(vb.id) FILTER (WHERE vb.situacao = 'IR Futuro')::INT AS total_ir_futuro_geral,
+        COUNT(vb.id) FILTER (WHERE vb.situacao = 'Distrato')::INT AS total_distrato_geral,
 
         COALESCE(SUM(vb.valor_comissao_total), 0)::NUMERIC AS total_comissao_bruta,
         COALESCE(SUM(vb.valor_imovel_venda), 0)::NUMERIC AS total_vendido,
 
-        COALESCE(SUM(COALESCE(cpv.total_repasse_corretores, 0)), 0)::NUMERIC AS total_repasse_corretores,
-        COALESCE(SUM(COALESCE(cpv.repasse_usuario, 0)), 0)::NUMERIC AS repasse_usuario,
+        COALESCE(SUM(COALESCE(rpv.total_repasse_corretores_e_captacao, 0)), 0)::NUMERIC AS total_repasse_corretores,
+        COALESCE(SUM(COALESCE(rpv.total_repasse_captacao, 0)), 0)::NUMERIC AS total_repasse_captacao,
+        COALESCE(SUM(COALESCE(rpv.repasse_usuario, 0)), 0)::NUMERIC AS repasse_usuario,
 
         COALESCE(SUM(vb.valor_repasse_gerencia), 0)::NUMERIC AS total_repasse_gerencia,
         COALESCE(SUM(vb.valor_repasse_imobiliaria), 0)::NUMERIC AS total_repasse_imobiliaria,
@@ -219,11 +248,10 @@ router.get('/resumo', async (req, res) => {
         COALESCE(SUM(COALESCE(pu.total_pago, 0)), 0)::NUMERIC AS pago_usuario,
         COALESCE(SUM(COALESCE(pc.total_pago, 0)), 0)::NUMERIC AS pago_corretores,
         COALESCE(SUM(COALESCE(pg.total_pago, 0)), 0)::NUMERIC AS pago_gerencia,
-
         COALESCE(SUM(COALESCE(ri.total_recebido, 0)), 0)::NUMERIC AS total_recebido_imobiliaria
 
       FROM vendas_base vb
-      LEFT JOIN corretores_por_venda cpv ON cpv.venda_id = vb.id
+      LEFT JOIN repasses_por_venda rpv ON rpv.venda_id = vb.id
       LEFT JOIN pagamentos_usuario pu ON pu.venda_id = vb.id
       LEFT JOIN pagamentos_corretores pc ON pc.venda_id = vb.id
       LEFT JOIN pagamentos_gerencia pg ON pg.venda_id = vb.id
@@ -232,30 +260,25 @@ router.get('/resumo', async (req, res) => {
       queryParams
     );
 
-    const row = result.rows[0];
-
+    const row = result.rows[0] || {};
     const perfil = req.user.perfil;
 
     const totalComissaoBruta = Number(row.total_comissao_bruta || 0);
     const totalRepasseCorretores = Number(row.total_repasse_corretores || 0);
+    const totalRepasseCaptacao = Number(row.total_repasse_captacao || 0);
     const totalRepasseGerencia = Number(row.total_repasse_gerencia || 0);
     const totalRepasseImobiliaria = Number(row.total_repasse_imobiliaria || 0);
 
     const repasseUsuario = Number(row.repasse_usuario || 0);
     const pagoUsuario = Number(row.pago_usuario || 0);
-
     const pagoCorretores = Number(row.pago_corretores || 0);
     const pagoGerencia = Number(row.pago_gerencia || 0);
-
     const totalRecebidoImobiliaria = Number(row.total_recebido_imobiliaria || 0);
 
     let totalComissao = totalComissaoBruta;
     let totalRepasseCorretor = totalRepasseCorretores;
     let comissaoPaga = pagoCorretores + pagoGerencia;
-    let comissaoAReceber = Math.max(
-      totalRepasseCorretores + totalRepasseGerencia - pagoCorretores - pagoGerencia,
-      0
-    );
+    let comissaoAReceber = Math.max(totalRepasseCorretores + totalRepasseGerencia - pagoCorretores - pagoGerencia, 0);
 
     if (perfil === 'gerente') {
       totalComissao = totalRepasseGerencia;
@@ -272,11 +295,11 @@ router.get('/resumo', async (req, res) => {
     }
 
     return res.json({
-      totalVendas: Number(row.total_vendas || 0),
-      totalConcluidas: Number(row.total_concluidas || 0),
-      totalEmProcesso: Number(row.total_em_processo || 0),
-      totalIrFuturo: Number(row.total_ir_futuro || 0),
-      totalDistrato: Number(row.total_distrato || 0),
+      totalVendas: perfil === 'corretor' ? Number(row.total_vendas_usuario || 0) : Number(row.total_vendas_geral || 0),
+      totalConcluidas: perfil === 'corretor' ? Number(row.total_concluidas_usuario || 0) : Number(row.total_concluidas_geral || 0),
+      totalEmProcesso: Number(row.total_em_processo_geral || 0),
+      totalIrFuturo: Number(row.total_ir_futuro_geral || 0),
+      totalDistrato: Number(row.total_distrato_geral || 0),
 
       totalComissao,
       totalVendido: Number(row.total_vendido || 0),
@@ -284,6 +307,9 @@ router.get('/resumo', async (req, res) => {
       totalRepasseCorretor,
       totalRepasseGerencia,
       totalRepasseImobiliaria,
+      totalRepasseCaptacao,
+      totalPagoCaptacao: 0,
+      totalPendenteCaptacao: totalRepasseCaptacao,
 
       comissaoAReceber,
       comissaoPaga,
@@ -311,21 +337,7 @@ router.get('/resumo', async (req, res) => {
 
 router.get('/ranking-corretores', async (req, res) => {
   try {
-    if (req.user.perfil === 'corretor') {
-      return res.status(403).json({
-        message: 'Acesso restrito a admin e gerente'
-      });
-    }
-
-    const { params, whereSql } = montarFiltrosDashboard(req, 'v');
-
-    const rankingParams = [...params];
-    let filtroParticipante = '';
-
-    if (req.user.perfil === 'gerente') {
-      rankingParams.push(req.user.id);
-      filtroParticipante = `WHERE u.gerente_id = $${rankingParams.length}`;
-    }
+    const { params, whereSql } = wherePeriodoSql(req, 'v');
 
     const result = await pool.query(
       `
@@ -335,14 +347,15 @@ router.get('/ranking-corretores', async (req, res) => {
         ${whereSql}
       ),
 
-      participantes AS (
+      vendedores AS (
         SELECT
           vc.corretor_id,
           vb.id AS venda_id,
           vb.situacao,
           vb.valor_imovel_venda,
           vb.valor_comissao_total,
-          vc.valor_repasse
+          COALESCE(vc.valor_repasse, 0)::NUMERIC AS valor_repasse,
+          'venda' AS tipo
         FROM vendas_base vb
         INNER JOIN venda_corretores vc ON vc.venda_id = vb.id
 
@@ -354,7 +367,8 @@ router.get('/ranking-corretores', async (req, res) => {
           vb.situacao,
           vb.valor_imovel_venda,
           vb.valor_comissao_total,
-          COALESCE(vb.valor_repasse_corretor, 0) AS valor_repasse
+          COALESCE(vb.valor_repasse_corretor, 0)::NUMERIC AS valor_repasse,
+          'venda' AS tipo
         FROM vendas_base vb
         WHERE vb.corretor_id IS NOT NULL
           AND NOT EXISTS (
@@ -363,53 +377,63 @@ router.get('/ranking-corretores', async (req, res) => {
             WHERE vc.venda_id = vb.id
               AND vc.corretor_id = vb.corretor_id
           )
+
+        UNION ALL
+
+        SELECT
+          vb.captador_id AS corretor_id,
+          vb.id AS venda_id,
+          vb.situacao,
+          0::NUMERIC AS valor_imovel_venda,
+          0::NUMERIC AS valor_comissao_total,
+          COALESCE(vb.valor_captacao, 0)::NUMERIC AS valor_repasse,
+          'captacao' AS tipo
+        FROM vendas_base vb
+        WHERE vb.captacao = 'Sim'
+          AND vb.captador_id IS NOT NULL
+          AND COALESCE(vb.valor_captacao, 0) > 0
       )
 
       SELECT
         u.id AS corretor_id,
         u.nome AS corretor_nome,
+        g.nome AS gerente_nome,
 
-        COUNT(p.venda_id)::INT AS total_vendas,
-        COUNT(p.venda_id) FILTER (
-          WHERE p.situacao = 'Concluído' OR p.situacao = 'Concluido'
+        COUNT(v.venda_id) FILTER (WHERE v.tipo = 'venda')::INT AS total_vendas,
+        COUNT(v.venda_id) FILTER (
+          WHERE v.tipo = 'venda'
+            AND (v.situacao = 'Concluído' OR v.situacao = 'Concluido')
         )::INT AS vendas_concluidas,
 
-        COALESCE(SUM(p.valor_imovel_venda), 0)::NUMERIC AS total_vendido,
-        COALESCE(SUM(p.valor_comissao_total), 0)::NUMERIC AS total_comissao,
-        COALESCE(SUM(p.valor_repasse), 0)::NUMERIC AS total_repasse,
+        COALESCE(SUM(v.valor_imovel_venda) FILTER (WHERE v.tipo = 'venda'), 0)::NUMERIC AS total_vendido,
+        COALESCE(SUM(v.valor_comissao_total) FILTER (WHERE v.tipo = 'venda'), 0)::NUMERIC AS total_comissao,
+        COALESCE(SUM(v.valor_repasse), 0)::NUMERIC AS total_repasse,
 
         COALESCE(SUM(pg.total_pago), 0)::NUMERIC AS comissao_paga,
+        GREATEST(COALESCE(SUM(v.valor_repasse), 0) - COALESCE(SUM(pg.total_pago), 0), 0)::NUMERIC AS comissao_a_receber
 
-        GREATEST(
-          COALESCE(SUM(p.valor_repasse), 0) - COALESCE(SUM(pg.total_pago), 0),
-          0
-        )::NUMERIC AS comissao_a_receber
-
-      FROM participantes p
-      INNER JOIN usuarios u ON u.id = p.corretor_id
+      FROM vendedores v
+      INNER JOIN usuarios u ON u.id = v.corretor_id
+      LEFT JOIN usuarios g ON g.id = u.gerente_id
 
       LEFT JOIN LATERAL (
         SELECT COALESCE(SUM(uc.valor), 0)::NUMERIC AS total_pago
         FROM usuarios_comprovantes uc
-        WHERE uc.venda_id = p.venda_id
-          AND (
-            uc.usuario_id = p.corretor_id
-            OR uc.corretor_id = p.corretor_id
-          )
+        WHERE uc.venda_id = v.venda_id
+          AND (uc.usuario_id = v.corretor_id OR uc.corretor_id = v.corretor_id)
       ) pg ON TRUE
 
-      ${filtroParticipante}
-
-      GROUP BY u.id, u.nome
-      ORDER BY total_vendido DESC, total_vendas DESC
-      LIMIT 10
+      GROUP BY u.id, u.nome, g.nome
+      ORDER BY total_repasse DESC, total_vendas DESC
+      LIMIT 20
       `,
-      rankingParams
+      params
     );
 
     return res.json(result.rows.map(row => ({
       corretorId: row.corretor_id,
       corretorNome: row.corretor_nome,
+      gerenteNome: row.gerente_nome,
       totalVendas: Number(row.total_vendas || 0),
       vendasConcluidas: Number(row.vendas_concluidas || 0),
       totalVendido: Number(row.total_vendido || 0),
@@ -427,6 +451,64 @@ router.get('/ranking-corretores', async (req, res) => {
   }
 });
 
+router.get('/ranking-captacao', async (req, res) => {
+  try {
+    const { params, whereSql } = wherePeriodoSql(req, 'v');
+
+    const result = await pool.query(
+      `
+      WITH vendas_base AS (
+        SELECT v.*
+        FROM vendas v
+        ${whereSql}
+      )
+
+      SELECT
+        u.id AS captador_id,
+        COALESCE(u.nome, vb.captador_nome, vb.captador_parceiro_nome, 'Captação') AS captador_nome,
+        g.nome AS gerente_nome,
+        COUNT(vb.id)::INT AS total_captacoes,
+        COALESCE(SUM(vb.valor_captacao), 0)::NUMERIC AS total_valor_captacao,
+        COALESCE(SUM(pg.total_pago), 0)::NUMERIC AS total_pago,
+        GREATEST(COALESCE(SUM(vb.valor_captacao), 0) - COALESCE(SUM(pg.total_pago), 0), 0)::NUMERIC AS total_pendente
+      FROM vendas_base vb
+      LEFT JOIN usuarios u ON u.id = vb.captador_id
+      LEFT JOIN usuarios g ON g.id = u.gerente_id
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(uc.valor), 0)::NUMERIC AS total_pago
+        FROM usuarios_comprovantes uc
+        WHERE uc.venda_id = vb.id
+          AND vb.captador_id IS NOT NULL
+          AND (uc.usuario_id = vb.captador_id OR uc.corretor_id = vb.captador_id)
+      ) pg ON TRUE
+      WHERE vb.captacao = 'Sim'
+        AND COALESCE(vb.valor_captacao, 0) > 0
+        AND (vb.captador_id IS NOT NULL OR COALESCE(vb.captador_nome, vb.captador_parceiro_nome) IS NOT NULL)
+      GROUP BY u.id, COALESCE(u.nome, vb.captador_nome, vb.captador_parceiro_nome, 'Captação'), g.nome
+      ORDER BY total_valor_captacao DESC, total_captacoes DESC
+      LIMIT 20
+      `,
+      params
+    );
+
+    return res.json(result.rows.map(row => ({
+      captadorId: row.captador_id,
+      captadorNome: row.captador_nome,
+      gerenteNome: row.gerente_nome,
+      totalCaptacoes: Number(row.total_captacoes || 0),
+      totalValorCaptacao: Number(row.total_valor_captacao || 0),
+      totalPago: Number(row.total_pago || 0),
+      totalPendente: Number(row.total_pendente || 0)
+    })));
+  } catch (error) {
+    console.error(error);
+
+    return res.status(500).json({
+      message: 'Erro ao carregar ranking de captação'
+    });
+  }
+});
+
 router.get('/evolucao-mensal', async (req, res) => {
   try {
     const { params, whereSql } = montarFiltrosDashboard(req, 'v');
@@ -436,16 +518,11 @@ router.get('/evolucao-mensal', async (req, res) => {
       SELECT
         TO_CHAR(DATE_TRUNC('month', COALESCE(v.assinatura_ccv, v.created_at)), 'YYYY-MM') AS mes,
         TO_CHAR(DATE_TRUNC('month', COALESCE(v.assinatura_ccv, v.created_at)), 'MM/YYYY') AS mes_label,
-
         COUNT(*)::INT AS total_vendas,
-        COUNT(*) FILTER (
-          WHERE v.situacao = 'Concluído' OR v.situacao = 'Concluido'
-        )::INT AS vendas_concluidas,
-
+        COUNT(*) FILTER (WHERE v.situacao = 'Concluído' OR v.situacao = 'Concluido')::INT AS vendas_concluidas,
         COALESCE(SUM(v.valor_imovel_venda), 0)::NUMERIC AS total_vendido,
         COALESCE(SUM(v.valor_comissao_total), 0)::NUMERIC AS total_comissao,
         COALESCE(SUM(v.valor_repasse_corretor), 0)::NUMERIC AS total_repasse_corretor
-
       FROM vendas v
       ${whereSql}
       GROUP BY DATE_TRUNC('month', COALESCE(v.assinatura_ccv, v.created_at))
@@ -544,7 +621,6 @@ router.get('/modalidades', async (req, res) => {
 router.get('/comissoes-mes', async (req, res) => {
   try {
     const { params, whereSql } = montarFiltrosDashboard(req, 'v');
-
     const usuarioParamIndex = params.length + 1;
     const queryParams = [...params, req.user.id];
 
@@ -558,73 +634,43 @@ router.get('/comissoes-mes', async (req, res) => {
         ${whereSql}
       ),
 
-      participantes AS (
-        SELECT
-          vc.venda_id,
-          vc.corretor_id,
-          COALESCE(vc.valor_repasse, 0)::NUMERIC AS valor_repasse
+      repasses AS (
+        SELECT vc.venda_id, vc.corretor_id, COALESCE(vc.valor_repasse, 0)::NUMERIC AS valor_repasse
         FROM venda_corretores vc
         INNER JOIN vendas_base vb ON vb.id = vc.venda_id
 
         UNION ALL
 
-        SELECT
-          vb.id AS venda_id,
-          vb.corretor_id,
-          COALESCE(vb.valor_repasse_corretor, 0)::NUMERIC AS valor_repasse
+        SELECT vb.id, vb.corretor_id, COALESCE(vb.valor_repasse_corretor, 0)::NUMERIC
         FROM vendas_base vb
         WHERE vb.corretor_id IS NOT NULL
           AND NOT EXISTS (
-            SELECT 1
-            FROM venda_corretores vc
-            WHERE vc.venda_id = vb.id
-              AND vc.corretor_id = vb.corretor_id
+            SELECT 1 FROM venda_corretores vc WHERE vc.venda_id = vb.id AND vc.corretor_id = vb.corretor_id
           )
+
+        UNION ALL
+
+        SELECT vb.id, vb.captador_id, COALESCE(vb.valor_captacao, 0)::NUMERIC
+        FROM vendas_base vb
+        WHERE vb.captacao = 'Sim'
+          AND vb.captador_id IS NOT NULL
       ),
 
-      corretores_por_venda AS (
+      repasses_por_venda AS (
         SELECT
-          p.venda_id,
-
-          COALESCE(SUM(p.valor_repasse), 0)::NUMERIC AS total_repasse_corretores,
-
-          COALESCE(
-            SUM(p.valor_repasse) FILTER (
-              WHERE p.corretor_id = $${usuarioParamIndex}
-            ),
-            0
-          )::NUMERIC AS repasse_usuario
-
-        FROM participantes p
-        GROUP BY p.venda_id
+          r.venda_id,
+          COALESCE(SUM(r.valor_repasse), 0)::NUMERIC AS total_repasse_corretores,
+          COALESCE(SUM(r.valor_repasse) FILTER (WHERE r.corretor_id = $${usuarioParamIndex}), 0)::NUMERIC AS repasse_usuario
+        FROM repasses r
+        GROUP BY r.venda_id
       ),
 
       pagamentos_por_venda AS (
         SELECT
           uc.venda_id,
-
-          COALESCE(
-            SUM(uc.valor) FILTER (
-              WHERE u.perfil = 'corretor'
-            ),
-            0
-          )::NUMERIC AS pago_corretores,
-
-          COALESCE(
-            SUM(uc.valor) FILTER (
-              WHERE u.perfil = 'gerente'
-            ),
-            0
-          )::NUMERIC AS pago_gerencia,
-
-          COALESCE(
-            SUM(uc.valor) FILTER (
-              WHERE uc.usuario_id = $${usuarioParamIndex}
-                OR uc.corretor_id = $${usuarioParamIndex}
-            ),
-            0
-          )::NUMERIC AS pago_usuario
-
+          COALESCE(SUM(uc.valor) FILTER (WHERE u.perfil = 'corretor'), 0)::NUMERIC AS pago_corretores,
+          COALESCE(SUM(uc.valor) FILTER (WHERE u.perfil = 'gerente'), 0)::NUMERIC AS pago_gerencia,
+          COALESCE(SUM(uc.valor) FILTER (WHERE uc.usuario_id = $${usuarioParamIndex} OR uc.corretor_id = $${usuarioParamIndex}), 0)::NUMERIC AS pago_usuario
         FROM usuarios_comprovantes uc
         INNER JOIN vendas_base vb ON vb.id = uc.venda_id
         INNER JOIN usuarios u ON u.id = COALESCE(uc.usuario_id, uc.corretor_id)
@@ -634,17 +680,14 @@ router.get('/comissoes-mes', async (req, res) => {
       SELECT
         TO_CHAR(vb.mes_ref, 'YYYY-MM') AS mes,
         TO_CHAR(vb.mes_ref, 'MM/YYYY') AS mes_label,
-
-        COALESCE(SUM(COALESCE(cpv.total_repasse_corretores, 0)), 0)::NUMERIC AS total_repasse_corretores,
+        COALESCE(SUM(COALESCE(rpv.total_repasse_corretores, 0)), 0)::NUMERIC AS total_repasse_corretores,
         COALESCE(SUM(vb.valor_repasse_gerencia), 0)::NUMERIC AS total_repasse_gerencia,
-        COALESCE(SUM(COALESCE(cpv.repasse_usuario, 0)), 0)::NUMERIC AS repasse_usuario,
-
+        COALESCE(SUM(COALESCE(rpv.repasse_usuario, 0)), 0)::NUMERIC AS repasse_usuario,
         COALESCE(SUM(COALESCE(ppv.pago_corretores, 0)), 0)::NUMERIC AS pago_corretores,
         COALESCE(SUM(COALESCE(ppv.pago_gerencia, 0)), 0)::NUMERIC AS pago_gerencia,
         COALESCE(SUM(COALESCE(ppv.pago_usuario, 0)), 0)::NUMERIC AS pago_usuario
-
       FROM vendas_base vb
-      LEFT JOIN corretores_por_venda cpv ON cpv.venda_id = vb.id
+      LEFT JOIN repasses_por_venda rpv ON rpv.venda_id = vb.id
       LEFT JOIN pagamentos_por_venda ppv ON ppv.venda_id = vb.id
       GROUP BY vb.mes_ref
       ORDER BY vb.mes_ref
@@ -658,7 +701,6 @@ router.get('/comissoes-mes', async (req, res) => {
       const totalRepasseCorretores = Number(row.total_repasse_corretores || 0);
       const totalRepasseGerencia = Number(row.total_repasse_gerencia || 0);
       const repasseUsuario = Number(row.repasse_usuario || 0);
-
       const pagoCorretores = Number(row.pago_corretores || 0);
       const pagoGerencia = Number(row.pago_gerencia || 0);
       const pagoUsuario = Number(row.pago_usuario || 0);

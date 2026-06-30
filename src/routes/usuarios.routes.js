@@ -273,13 +273,17 @@ async function corretorPertenceVenda(vendaId, usuarioId) {
     SELECT 1
     FROM vendas v
     WHERE v.id = $1
-      AND v.corretor_id = $2
+      AND (
+        v.corretor_id = $2
+        OR v.corretor_2_id = $2
+        OR v.captador_id = $2
+      )
 
     UNION
 
     SELECT 1
     FROM vendas v
-    INNER JOIN usuarios c ON c.id = v.corretor_id
+    INNER JOIN usuarios c ON c.id IN (v.corretor_id, v.corretor_2_id, v.captador_id)
     WHERE v.id = $1
       AND c.gerente_id = $2
 
@@ -323,7 +327,11 @@ async function recalcularStatusComissaoVendaCorretor(vendaId, usuarioId) {
   const corretorResult = await pool.query(
     `
     SELECT
-      COALESCE(vc.valor_repasse, v.valor_repasse_corretor, 0)::NUMERIC AS valor_repasse
+      CASE
+        WHEN v.captador_id = $2 THEN COALESCE(v.valor_captacao, 0)
+        ELSE COALESCE(vc.valor_repasse, v.valor_repasse_corretor, 0)
+      END::NUMERIC AS valor_repasse,
+      CASE WHEN v.captador_id = $2 THEN TRUE ELSE FALSE END AS eh_captador
     FROM vendas v
     LEFT JOIN venda_corretores vc
       ON vc.venda_id = v.id
@@ -363,21 +371,23 @@ async function recalcularStatusComissaoVendaCorretor(vendaId, usuarioId) {
     status = 'Pago';
   }
 
-  await pool.query(
-    `
-    UPDATE venda_corretores
-    SET
-      valor_pago = $1,
-      saldo_pendente = $2,
-      status_pagamento = $3,
-      updated_at = NOW()
-    WHERE venda_id = $4
-      AND corretor_id = $5
-    `,
-    [totalPago, saldo, status, vendaId, usuarioId]
-  );
+  if (!corretorResult.rows[0].eh_captador) {
+    await pool.query(
+      `
+      UPDATE venda_corretores
+      SET
+        valor_pago = $1,
+        saldo_pendente = $2,
+        status_pagamento = $3,
+        updated_at = NOW()
+      WHERE venda_id = $4
+        AND corretor_id = $5
+      `,
+      [totalPago, saldo, status, vendaId, usuarioId]
+    );
 
-  await recalcularStatusComissaoVendaGeral(vendaId);
+    await recalcularStatusComissaoVendaGeral(vendaId);
+  }
 }
 
 async function recalcularStatusComissaoVendaGeral(vendaId) {
@@ -435,11 +445,8 @@ router.get('/', somentePerfis('admin', 'gerente'), async (req, res) => {
     let where = '';
 
     if (req.user.perfil === 'gerente') {
-      params.push(req.user.id);
-
       where = `
         WHERE u.perfil = 'corretor'
-          AND u.gerente_id = $1
       `;
     }
 

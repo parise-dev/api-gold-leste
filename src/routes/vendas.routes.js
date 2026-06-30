@@ -10,6 +10,51 @@ function normalizarSituacao(situacao) {
   return situacao || 'Em processo';
 }
 
+function dinheiro(valor) {
+  const numero = Number(valor || 0);
+  return Number.isFinite(numero) ? numero : 0;
+}
+
+function textoValor(valor) {
+  if (valor === null || valor === undefined) return null;
+  if (typeof valor === 'object') return JSON.stringify(valor);
+  return String(valor);
+}
+
+function calcularStatusFinanceiro(total, recebido) {
+  const totalNumero = dinheiro(total);
+  const recebidoNumero = dinheiro(recebido);
+
+  if (recebidoNumero <= 0) return 'Não pago';
+  if (totalNumero > 0 && recebidoNumero >= totalNumero) return 'Pago';
+  return 'Parcial';
+}
+
+function totalDistribuido(body) {
+  return (
+    dinheiro(body.valorRepasseCorretor) +
+    dinheiro(body.valorRepasseCorretor2) +
+    dinheiro(body.valorRepasseGerencia) +
+    dinheiro(body.valorCaptacao) +
+    dinheiro(body.valorFechador) +
+    dinheiro(body.valorRepasseImobiliaria)
+  );
+}
+
+function validarTotalRepasses(body) {
+  const totalComissao = dinheiro(body.valorComissaoTotal);
+  const distribuido = totalDistribuido(body);
+
+  if (distribuido > totalComissao + 0.01) {
+    return {
+      ok: false,
+      message: 'A soma dos repasses não pode ser maior que a comissão total.'
+    };
+  }
+
+  return { ok: true };
+}
+
 function montarFiltroEscopo(req, params, alias = 'v') {
   const where = [];
   const prefixo = alias ? `${alias}.` : '';
@@ -21,6 +66,8 @@ function montarFiltroEscopo(req, params, alias = 'v') {
     where.push(`
       (
         ${prefixo}corretor_id = $${idx}
+        OR ${prefixo}corretor_2_id = $${idx}
+        OR ${prefixo}captador_id = $${idx}
         OR EXISTS (
           SELECT 1
           FROM venda_corretores vc_escopo
@@ -37,10 +84,12 @@ function montarFiltroEscopo(req, params, alias = 'v') {
 
     where.push(`
       (
-        EXISTS (
+        ${prefixo}created_by = $${idx}
+        OR ${prefixo}updated_by = $${idx}
+        OR EXISTS (
           SELECT 1
           FROM usuarios c_escopo
-          WHERE c_escopo.id = ${prefixo}corretor_id
+          WHERE c_escopo.id IN (${prefixo}corretor_id, ${prefixo}corretor_2_id, ${prefixo}captador_id)
             AND c_escopo.gerente_id = $${idx}
         )
         OR EXISTS (
@@ -58,12 +107,10 @@ function montarFiltroEscopo(req, params, alias = 'v') {
 }
 
 async function vendaPertenceAoEscopo(req, vendaId) {
-  if (req.user.perfil === 'admin') {
-    return true;
-  }
+  if (req.user.perfil === 'admin') return true;
 
   const params = [vendaId];
-  const where = [`v.id = $1`];
+  const where = ['v.id = $1'];
   where.push(...montarFiltroEscopo(req, params, 'v'));
 
   const result = await pool.query(
@@ -79,53 +126,57 @@ async function vendaPertenceAoEscopo(req, vendaId) {
   return result.rows.length > 0;
 }
 
-async function validarCorretoresParaUsuario(req, corretores = []) {
+async function validarCorretoresExistem(corretores = []) {
   const ids = corretores
     .map(item => item?.corretorId)
     .filter(Boolean)
     .map(String);
 
-  if (!ids.length) {
-    return {
-      ok: true
-    };
-  }
+  if (!ids.length) return { ok: true };
 
-  if (req.user.perfil === 'admin') {
-    return {
-      ok: true
-    };
-  }
+  const idsUnicos = [...new Set(ids)];
 
   const result = await pool.query(
     `
     SELECT id
     FROM usuarios
     WHERE perfil = 'corretor'
-      AND gerente_id = $1
-      AND id = ANY($2::uuid[])
+      AND ativo = TRUE
+      AND id = ANY($1::uuid[])
     `,
-    [req.user.id, ids]
+    [idsUnicos]
   );
 
-  if (result.rows.length !== ids.length) {
+  if (result.rows.length !== idsUnicos.length) {
     return {
       ok: false,
-      message: 'Gerente só pode movimentar vendas de corretores da própria equipe'
+      message: 'Selecione apenas corretores ativos cadastrados no sistema.'
     };
   }
 
-  return {
-    ok: true
-  };
+  return { ok: true };
 }
 
-async function salvarCorretoresVenda(vendaId, corretores = []) {
-  await pool.query(
+async function buscarNomeCorretor(corretorId) {
+  if (!corretorId) return null;
+
+  const result = await pool.query(
     `
-    DELETE FROM venda_corretores
-    WHERE venda_id = $1
+    SELECT nome
+    FROM usuarios
+    WHERE id = $1
+      AND perfil = 'corretor'
+    LIMIT 1
     `,
+    [corretorId]
+  );
+
+  return result.rows[0]?.nome || null;
+}
+
+async function salvarCorretoresVenda(client, vendaId, corretores = []) {
+  await client.query(
+    `DELETE FROM venda_corretores WHERE venda_id = $1`,
     [vendaId]
   );
 
@@ -135,26 +186,13 @@ async function salvarCorretoresVenda(vendaId, corretores = []) {
 
   for (let index = 0; index < listaValida.length; index++) {
     const item = listaValida[index];
+    const nome = await buscarNomeCorretor(item.corretorId);
 
-    const usuarioResult = await pool.query(
-      `
-      SELECT id, nome
-      FROM usuarios
-      WHERE id = $1
-        AND perfil = 'corretor'
-      LIMIT 1
-      `,
-      [item.corretorId]
-    );
+    if (!nome) continue;
 
-    if (!usuarioResult.rows.length) {
-      continue;
-    }
+    const valorRepasse = dinheiro(item.valorRepasse);
 
-    const usuario = usuarioResult.rows[0];
-    const valorRepasse = Number(item.valorRepasse || 0);
-
-    await pool.query(
+    await client.query(
       `
       INSERT INTO venda_corretores (
         venda_id,
@@ -179,22 +217,16 @@ async function salvarCorretoresVenda(vendaId, corretores = []) {
         END,
         updated_at = NOW()
       `,
-      [
-        vendaId,
-        usuario.id,
-        usuario.nome,
-        index + 1,
-        valorRepasse
-      ]
+      [vendaId, item.corretorId, nome, index + 1, valorRepasse]
     );
   }
 
-  await sincronizarCamposLegadosVenda(vendaId);
-  await recalcularStatusComissaoVendaGeral(vendaId);
+  await sincronizarCamposLegadosVenda(client, vendaId);
+  await recalcularStatusComissaoVendaGeral(client, vendaId);
 }
 
-async function sincronizarCamposLegadosVenda(vendaId) {
-  const result = await pool.query(
+async function sincronizarCamposLegadosVenda(client, vendaId) {
+  const result = await client.query(
     `
     SELECT *
     FROM venda_corretores
@@ -208,10 +240,10 @@ async function sincronizarCamposLegadosVenda(vendaId) {
   const segundo = result.rows[1] || null;
 
   const totalRepasse = result.rows.reduce((total, item) => {
-    return total + Number(item.valor_repasse || 0);
+    return total + dinheiro(item.valor_repasse);
   }, 0);
 
-  await pool.query(
+  await client.query(
     `
     UPDATE vendas
     SET
@@ -228,45 +260,38 @@ async function sincronizarCamposLegadosVenda(vendaId) {
       principal?.corretor_nome || null,
       segundo?.corretor_id || null,
       segundo?.corretor_nome || null,
-      Number(segundo?.valor_repasse || 0),
+      dinheiro(segundo?.valor_repasse),
       totalRepasse,
       vendaId
     ]
   );
 }
 
-async function recalcularStatusComissaoVendaGeral(vendaId) {
-  if (!vendaId) {
-    return;
-  }
-
-  const result = await pool.query(
+async function recalcularStatusComissaoVendaGeral(client, vendaId) {
+  const result = await client.query(
     `
     SELECT
-      COALESCE(SUM(vc.valor_repasse), 0)::NUMERIC AS total_repasse,
-      COALESCE(SUM(vc.valor_pago), 0)::NUMERIC AS total_pago
-    FROM venda_corretores vc
-    WHERE vc.venda_id = $1
+      COALESCE(SUM(valor_repasse), 0)::NUMERIC AS total_repasse,
+      COALESCE(SUM(valor_pago), 0)::NUMERIC AS total_pago
+    FROM venda_corretores
+    WHERE venda_id = $1
     `,
     [vendaId]
   );
 
-  const totalRepasse = Number(result.rows[0]?.total_repasse || 0);
-  const totalPago = Number(result.rows[0]?.total_pago || 0);
+  const totalRepasse = dinheiro(result.rows[0]?.total_repasse);
+  const totalPago = dinheiro(result.rows[0]?.total_pago);
 
   let status = 'Pendente';
   let dataPagamento = null;
 
-  if (totalPago > 0 && totalPago < totalRepasse) {
-    status = 'Parcial';
-  }
-
+  if (totalPago > 0 && totalPago < totalRepasse) status = 'Parcial';
   if (totalRepasse > 0 && totalPago >= totalRepasse) {
     status = 'Pago';
     dataPagamento = new Date();
   }
 
-  await pool.query(
+  await client.query(
     `
     UPDATE vendas
     SET
@@ -278,63 +303,76 @@ async function recalcularStatusComissaoVendaGeral(vendaId) {
   );
 }
 
+async function registrarLogVenda(client, vendaId, req, acao, campo = null, anterior = null, novo = null, dadosAnteriores = null, dadosNovos = null) {
+  await client.query(
+    `
+    INSERT INTO venda_logs (
+      venda_id,
+      usuario_id,
+      usuario_nome,
+      acao,
+      campo,
+      valor_anterior,
+      valor_novo,
+      dados_anteriores,
+      dados_novos
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    `,
+    [
+      vendaId,
+      req.user.id,
+      req.user.nome,
+      acao,
+      campo,
+      textoValor(anterior),
+      textoValor(novo),
+      dadosAnteriores ? JSON.stringify(dadosAnteriores) : null,
+      dadosNovos ? JSON.stringify(dadosNovos) : null
+    ]
+  );
+}
+
+async function registrarLogsAlteracao(client, vendaId, req, vendaAntes, vendaDepois) {
+  const campos = [
+    ['cliente', 'cliente'],
+    ['cpf_cliente', 'cpf'],
+    ['empreendimento_rua', 'empreendimento'],
+    ['numero_unidade', 'unidade'],
+    ['corretor_id', 'corretor principal'],
+    ['corretor_2_id', 'segundo corretor'],
+    ['situacao', 'situação'],
+    ['captacao', 'captação'],
+    ['captador_id', 'captador'],
+    ['captador_tipo', 'tipo captador'],
+    ['captador_parceiro_nome', 'parceiro captação'],
+    ['captacao_observacao', 'observação captação'],
+    ['valor_captacao', 'valor captação'],
+    ['valor_comissao_total', 'comissão total'],
+    ['valor_repasse_corretor', 'repasse corretor'],
+    ['valor_repasse_corretor_2', 'repasse 2º corretor'],
+    ['valor_repasse_gerencia', 'repasse gerência'],
+    ['valor_repasse_imobiliaria', 'repasse imobiliária'],
+    ['valor_fechador', 'valor fechador'],
+    ['valor_imovel_venda', 'valor imóvel'],
+    ['modalidade_imovel', 'modalidade'],
+    ['assinatura_ccv', 'assinatura CCV']
+  ];
+
+  for (const [coluna, label] of campos) {
+    const antigo = textoValor(vendaAntes?.[coluna]);
+    const novo = textoValor(vendaDepois?.[coluna]);
+
+    if (antigo !== novo) {
+      await registrarLogVenda(client, vendaId, req, 'ALTERACAO', label, antigo, novo);
+    }
+  }
+}
+
 function mapVenda(row, req) {
   const isCorretor = req?.user?.perfil === 'corretor';
+  const statusFinanceiro = row.status_financeiro || calcularStatusFinanceiro(row.valor_comissao_total, row.valor_recebido_imobiliaria);
 
-  if (isCorretor) {
-    return {
-      id: row.id,
-      situacao: normalizarSituacao(row.situacao),
-
-      cliente: row.cliente,
-      cpfCliente: row.cpf_cliente,
-      empreendimentoRua: row.empreendimento_rua,
-      numeroUnidade: row.numero_unidade,
-
-      corretorId: row.usuario_corretor_id || row.corretor_id,
-      corretor: row.usuario_corretor_nome || row.corretor_nome || 'Corretor',
-
-      corretor2Id: null,
-      corretor2: '',
-      valorRepasseCorretor2: 0,
-
-      captacao: '',
-      valorCaptacao: 0,
-
-      valorComissaoTotal: Number(row.valor_repasse_usuario || 0),
-
-      nota: '',
-      valorNota: 0,
-
-      assinaturaCcv: row.assinatura_ccv,
-
-      fechador: '',
-      valorFechador: 0,
-
-      irFuturo: row.ir_futuro,
-
-      valorImovelVenda: Number(row.valor_imovel_venda || 0),
-      modalidadeImovel: row.modalidade_imovel,
-
-      valorRepasseCorretor: Number(row.valor_repasse_usuario || 0),
-      valorRepasseGerencia: 0,
-      valorRepasseImobiliaria: 0,
-
-      valorPagoComprovantes: Number(row.valor_pago_usuario || 0),
-      saldoPendente: Number(row.saldo_pendente_usuario || 0),
-
-      documentacaoValorCliente: 0,
-      documentacaoValorSobra: 0,
-
-      statusComissaoCorretor: row.status_pagamento_usuario || row.status_comissao_corretor,
-      dataPagamentoComissao: row.data_pagamento_comissao,
-
-      createdAt: row.created_at,
-      updatedAt: row.updated_at
-    };
-  }
-
-  return {
+  const base = {
     id: row.id,
     situacao: normalizarSituacao(row.situacao),
 
@@ -348,35 +386,45 @@ function mapVenda(row, req) {
 
     corretor2Id: row.corretor_2_id,
     corretor2: row.corretor_2_nome,
-    valorRepasseCorretor2: Number(row.valor_repasse_corretor_2 || 0),
+    valorRepasseCorretor2: dinheiro(row.valor_repasse_corretor_2),
 
-    captacao: row.captacao,
-    valorCaptacao: Number(row.valor_captacao || 0),
+    captacao: row.captacao || 'Não',
+    captadorId: row.captador_id,
+    captadorNome: row.captador_nome,
+    captadorTipo: row.captador_tipo,
+    captadorParceiroNome: row.captador_parceiro_nome,
+    captacaoObservacao: row.captacao_observacao,
+    valorCaptacao: dinheiro(row.valor_captacao),
 
-    valorComissaoTotal: Number(row.valor_comissao_total || 0),
+    valorComissaoTotal: dinheiro(row.valor_comissao_total),
 
     nota: row.nota,
-    valorNota: Number(row.valor_nota || 0),
+    valorNota: dinheiro(row.valor_nota),
 
     assinaturaCcv: row.assinatura_ccv,
 
     fechador: row.fechador,
-    valorFechador: Number(row.valor_fechador || 0),
+    valorFechador: dinheiro(row.valor_fechador),
 
     irFuturo: row.ir_futuro,
 
-    valorImovelVenda: Number(row.valor_imovel_venda || 0),
+    valorImovelVenda: dinheiro(row.valor_imovel_venda),
     modalidadeImovel: row.modalidade_imovel,
 
-    valorRepasseCorretor: Number(row.valor_repasse_corretor || 0),
-    valorRepasseGerencia: Number(row.valor_repasse_gerencia || 0),
-    valorRepasseImobiliaria: Number(row.valor_repasse_imobiliaria || 0),
+    valorRepasseCorretor: dinheiro(row.valor_repasse_corretor),
+    valorRepasseGerencia: dinheiro(row.valor_repasse_gerencia),
+    valorRepasseImobiliaria: dinheiro(row.valor_repasse_imobiliaria),
 
-    valorPagoComprovantes: Number(row.valor_pago_comprovantes || 0),
-    saldoPendente: Number(row.saldo_pendente || 0),
+    valorPagoComprovantes: dinheiro(row.valor_pago_comprovantes),
+    saldoPendente: dinheiro(row.saldo_pendente),
 
-    documentacaoValorCliente: Number(row.documentacao_valor_cliente || 0),
-    documentacaoValorSobra: Number(row.documentacao_valor_sobra || 0),
+    valorRecebidoImobiliaria: dinheiro(row.valor_recebido_imobiliaria),
+    saldoReceberImobiliaria: dinheiro(row.saldo_receber_imobiliaria),
+    statusFinanceiro,
+    statusFinanceiroComissao: statusFinanceiro,
+
+    documentacaoValorCliente: dinheiro(row.documentacao_valor_cliente),
+    documentacaoValorSobra: dinheiro(row.documentacao_valor_sobra),
 
     statusComissaoCorretor: row.status_comissao_corretor,
     dataPagamentoComissao: row.data_pagamento_comissao,
@@ -384,6 +432,66 @@ function mapVenda(row, req) {
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+
+  if (!isCorretor) return base;
+
+  return {
+    ...base,
+    corretorId: row.usuario_corretor_id || row.corretor_id,
+    corretor: row.usuario_corretor_nome || row.corretor_nome || 'Corretor',
+    valorComissaoTotal: dinheiro(row.valor_repasse_usuario),
+    valorRepasseCorretor: dinheiro(row.valor_repasse_usuario),
+    valorRepasseGerencia: 0,
+    valorRepasseImobiliaria: 0,
+    valorPagoComprovantes: dinheiro(row.valor_pago_usuario),
+    saldoPendente: dinheiro(row.saldo_pendente_usuario),
+    statusComissaoCorretor: row.status_pagamento_usuario || row.status_comissao_corretor
+  };
+}
+
+function camposVendaDoBody(body, req) {
+  const captacaoAtiva = body.captacao === 'Sim';
+  const captadorTipo = captacaoAtiva ? (body.captadorTipo || 'corretor') : null;
+  const captadorId = captacaoAtiva && captadorTipo === 'corretor' ? (body.captadorId || null) : null;
+  const captadorParceiroNome = captacaoAtiva && captadorTipo === 'parceiro' ? (body.captadorParceiroNome || null) : null;
+  const captadorNome = captacaoAtiva
+    ? (body.captadorNome || captadorParceiroNome || null)
+    : null;
+
+  return [
+    body.cliente,
+    body.cpfCliente || null,
+    body.empreendimentoRua || null,
+    body.numeroUnidade || null,
+    body.corretorId || null,
+    body.corretor || null,
+    body.corretor2Id || null,
+    body.corretor2 || null,
+    dinheiro(body.valorRepasseCorretor2),
+    normalizarSituacao(body.situacao),
+    captacaoAtiva ? 'Sim' : 'Não',
+    dinheiro(captacaoAtiva ? body.valorCaptacao : 0),
+    dinheiro(body.valorComissaoTotal),
+    body.nota || 'Não',
+    dinheiro(body.valorNota),
+    body.assinaturaCcv || null,
+    body.fechador || 'Não',
+    dinheiro(body.valorFechador),
+    body.irFuturo || 'Não',
+    dinheiro(body.valorImovelVenda),
+    body.modalidadeImovel || '',
+    dinheiro(body.valorRepasseCorretor),
+    dinheiro(body.valorRepasseGerencia),
+    dinheiro(body.valorRepasseImobiliaria),
+    dinheiro(body.documentacaoValorCliente),
+    dinheiro(body.documentacaoValorSobra),
+    captadorId,
+    captadorNome,
+    captadorTipo,
+    captadorParceiroNome,
+    captacaoAtiva ? (body.captacaoObservacao || null) : null,
+    req.user.id
+  ];
 }
 
 router.get('/', async (req, res) => {
@@ -395,7 +503,8 @@ router.get('/', async (req, res) => {
       dataInicio,
       dataFim,
       corretorId,
-      statusComissao
+      statusComissao,
+      vendaId
     } = req.query;
 
     const params = [];
@@ -403,14 +512,24 @@ router.get('/', async (req, res) => {
 
     where.push(...montarFiltroEscopo(req, params, 'v'));
 
+    if (vendaId) {
+      params.push(vendaId);
+      where.push(`v.id = $${params.length}`);
+    }
+
     if (corretorId && ['admin', 'gerente'].includes(req.user.perfil)) {
       params.push(corretorId);
       where.push(`
-        EXISTS (
-          SELECT 1
-          FROM venda_corretores vc
-          WHERE vc.venda_id = v.id
-            AND vc.corretor_id = $${params.length}
+        (
+          v.corretor_id = $${params.length}
+          OR v.corretor_2_id = $${params.length}
+          OR v.captador_id = $${params.length}
+          OR EXISTS (
+            SELECT 1
+            FROM venda_corretores vc
+            WHERE vc.venda_id = v.id
+              AND vc.corretor_id = $${params.length}
+          )
         )
       `);
     }
@@ -419,20 +538,20 @@ router.get('/', async (req, res) => {
       params.push(`%${String(busca).toLowerCase()}%`);
       where.push(`
         (
-          LOWER(v.cliente) LIKE $${params.length}
-          OR LOWER(v.cpf_cliente) LIKE $${params.length}
-          OR LOWER(v.empreendimento_rua) LIKE $${params.length}
-          OR LOWER(v.corretor_nome) LIKE $${params.length}
+          LOWER(COALESCE(v.cliente, '')) LIKE $${params.length}
+          OR LOWER(COALESCE(v.cpf_cliente, '')) LIKE $${params.length}
+          OR LOWER(COALESCE(v.empreendimento_rua, '')) LIKE $${params.length}
+          OR LOWER(COALESCE(v.corretor_nome, '')) LIKE $${params.length}
           OR LOWER(COALESCE(v.corretor_2_nome, '')) LIKE $${params.length}
-          OR LOWER(v.numero_unidade) LIKE $${params.length}
+          OR LOWER(COALESCE(v.captador_nome, '')) LIKE $${params.length}
+          OR LOWER(COALESCE(v.captador_parceiro_nome, '')) LIKE $${params.length}
+          OR LOWER(COALESCE(v.numero_unidade, '')) LIKE $${params.length}
         )
       `);
     }
 
     if (situacao) {
-      const situacaoNormalizada = normalizarSituacao(situacao);
-      params.push(situacaoNormalizada);
-
+      params.push(normalizarSituacao(situacao));
       where.push(`v.situacao = $${params.length}`);
     }
 
@@ -491,9 +610,18 @@ router.get('/', async (req, res) => {
               )
           ), 0),
           0
-        )::NUMERIC AS saldo_pendente
+        )::NUMERIC AS saldo_pendente,
+
+        COALESCE(ri.valor_recebido_imobiliaria, 0)::NUMERIC AS valor_recebido_imobiliaria,
+        GREATEST(COALESCE(v.valor_comissao_total, 0) - COALESCE(ri.valor_recebido_imobiliaria, 0), 0)::NUMERIC AS saldo_receber_imobiliaria,
+        CASE
+          WHEN COALESCE(ri.valor_recebido_imobiliaria, 0) <= 0 THEN 'Não pago'
+          WHEN COALESCE(ri.valor_recebido_imobiliaria, 0) >= COALESCE(v.valor_comissao_total, 0) THEN 'Pago'
+          ELSE 'Parcial'
+        END AS status_financeiro
 
       FROM vendas v
+
       LEFT JOIN LATERAL (
         SELECT
           vc.corretor_id,
@@ -535,8 +663,55 @@ router.get('/', async (req, res) => {
             WHERE vc2.venda_id = v.id
               AND vc2.corretor_id = $${usuarioParamIndex}
           )
+
+        UNION ALL
+
+        SELECT
+          v.captador_id,
+          COALESCE(v.captador_nome, 'Captação') AS corretor_nome,
+          COALESCE(v.valor_captacao, 0)::NUMERIC AS valor_repasse,
+          COALESCE((
+            SELECT SUM(c.valor)
+            FROM usuarios_comprovantes c
+            WHERE c.venda_id = v.id
+              AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+          ), 0)::NUMERIC AS valor_pago,
+          GREATEST(
+            COALESCE(v.valor_captacao, 0) - COALESCE((
+              SELECT SUM(c.valor)
+              FROM usuarios_comprovantes c
+              WHERE c.venda_id = v.id
+                AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+            ), 0),
+            0
+          )::NUMERIC AS saldo_pendente,
+          CASE
+            WHEN COALESCE((
+              SELECT SUM(c.valor)
+              FROM usuarios_comprovantes c
+              WHERE c.venda_id = v.id
+                AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+            ), 0) <= 0 THEN 'Pendente'
+            WHEN COALESCE((
+              SELECT SUM(c.valor)
+              FROM usuarios_comprovantes c
+              WHERE c.venda_id = v.id
+                AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+            ), 0) < COALESCE(v.valor_captacao, 0) THEN 'Parcial'
+            ELSE 'Pago'
+          END AS status_pagamento
+        WHERE v.captador_id = $${usuarioParamIndex}
+
         LIMIT 1
       ) pu ON TRUE
+
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(cr.valor_recebido), 0)::NUMERIC AS valor_recebido_imobiliaria
+        FROM contas_receber cr
+        WHERE cr.venda_id = v.id
+          AND cr.status IN ('Recebido', 'Parcial')
+      ) ri ON TRUE
+
       ${whereSql}
       ORDER BY v.assinatura_ccv DESC NULLS LAST, v.created_at DESC
       `,
@@ -560,27 +735,27 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
     const body = req.body;
 
     if (!body.cliente) {
-      return res.status(400).json({
-        message: 'Cliente é obrigatório'
-      });
+      return res.status(400).json({ message: 'Cliente é obrigatório' });
     }
 
-    const permissaoCorretores = await validarCorretoresParaUsuario(req, [
-      {
-        corretorId: body.corretorId
-      },
-      {
-        corretorId: body.corretor2Id
-      }
+    const validacaoRepasses = validarTotalRepasses(body);
+    if (!validacaoRepasses.ok) {
+      return res.status(400).json({ message: validacaoRepasses.message });
+    }
+
+    const permissaoCorretores = await validarCorretoresExistem([
+      { corretorId: body.corretorId },
+      { corretorId: body.corretor2Id },
+      { corretorId: body.captadorTipo === 'corretor' ? body.captadorId : null }
     ]);
 
     if (!permissaoCorretores.ok) {
-      return res.status(403).json({
-        message: permissaoCorretores.message
-      });
+      return res.status(400).json({ message: permissaoCorretores.message });
     }
 
     await client.query('BEGIN');
+
+    const valores = camposVendaDoBody(body, req);
 
     const result = await client.query(
       `
@@ -611,69 +786,57 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
         valor_repasse_imobiliaria,
         documentacao_valor_cliente,
         documentacao_valor_sobra,
+        captador_id,
+        captador_nome,
+        captador_tipo,
+        captador_parceiro_nome,
+        captacao_observacao,
         created_by,
         updated_by
       )
       VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
         $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28
+        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+        $31,$32,$32
       )
       RETURNING *
       `,
-      [
-        body.cliente,
-        body.cpfCliente || null,
-        body.empreendimentoRua || null,
-        body.numeroUnidade || null,
-        body.corretorId || null,
-        body.corretor || null,
-        body.corretor2Id || null,
-        body.corretor2 || null,
-        body.valorRepasseCorretor2 || 0,
-        normalizarSituacao(body.situacao),
-        body.captacao || 'Não',
-        body.valorCaptacao || 0,
-        body.valorComissaoTotal || 0,
-        body.nota || 'Não',
-        body.valorNota || 0,
-        body.assinaturaCcv || null,
-        body.fechador || 'Não',
-        body.valorFechador || 0,
-        body.irFuturo || 'Não',
-        body.valorImovelVenda || 0,
-        body.modalidadeImovel || '',
-        body.valorRepasseCorretor || 0,
-        body.valorRepasseGerencia || 0,
-        body.valorRepasseImobiliaria || 0,
-        body.documentacaoValorCliente || 0,
-        body.documentacaoValorSobra || 0,
-        req.user.id,
-        req.user.id
-      ]
+      valores
     );
 
     const vendaCriada = result.rows[0];
 
-    await client.query('COMMIT');
-
-    await salvarCorretoresVenda(vendaCriada.id, [
-      {
-        corretorId: body.corretorId,
-        valorRepasse: body.valorRepasseCorretor
-      },
-      {
-        corretorId: body.corretor2Id,
-        valorRepasse: body.valorRepasseCorretor2
-      }
+    await salvarCorretoresVenda(client, vendaCriada.id, [
+      { corretorId: body.corretorId, valorRepasse: body.valorRepasseCorretor },
+      { corretorId: body.corretor2Id, valorRepasse: body.valorRepasseCorretor2 }
     ]);
+
+    const vendaAtualizada = await client.query('SELECT * FROM vendas WHERE id = $1', [vendaCriada.id]);
+
+    await registrarLogVenda(
+      client,
+      vendaCriada.id,
+      req,
+      'CRIACAO',
+      null,
+      null,
+      null,
+      null,
+      vendaAtualizada.rows[0]
+    );
+
+    await client.query('COMMIT');
 
     const vendaAtualizadaResult = await pool.query(
       `
       SELECT
         v.*,
         0::NUMERIC AS valor_pago_comprovantes,
-        0::NUMERIC AS saldo_pendente
+        0::NUMERIC AS saldo_pendente,
+        0::NUMERIC AS valor_recebido_imobiliaria,
+        COALESCE(v.valor_comissao_total, 0)::NUMERIC AS saldo_receber_imobiliaria,
+        'Não pago' AS status_financeiro
       FROM vendas v
       WHERE v.id = $1
       `,
@@ -683,7 +846,6 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
     return res.status(201).json(mapVenda(vendaAtualizadaResult.rows[0], req));
   } catch (error) {
     await client.query('ROLLBACK');
-
     console.error(error);
 
     return res.status(500).json({
@@ -702,29 +864,34 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
     const body = req.body;
 
     const pertence = await vendaPertenceAoEscopo(req, id);
-
     if (!pertence) {
-      return res.status(403).json({
-        message: 'Você não tem permissão para editar esta venda'
-      });
+      return res.status(403).json({ message: 'Você não tem permissão para editar esta venda' });
     }
 
-    const permissaoCorretores = await validarCorretoresParaUsuario(req, [
-      {
-        corretorId: body.corretorId
-      },
-      {
-        corretorId: body.corretor2Id
-      }
+    const validacaoRepasses = validarTotalRepasses(body);
+    if (!validacaoRepasses.ok) {
+      return res.status(400).json({ message: validacaoRepasses.message });
+    }
+
+    const permissaoCorretores = await validarCorretoresExistem([
+      { corretorId: body.corretorId },
+      { corretorId: body.corretor2Id },
+      { corretorId: body.captadorTipo === 'corretor' ? body.captadorId : null }
     ]);
 
     if (!permissaoCorretores.ok) {
-      return res.status(403).json({
-        message: permissaoCorretores.message
-      });
+      return res.status(400).json({ message: permissaoCorretores.message });
     }
 
     await client.query('BEGIN');
+
+    const antesResult = await client.query('SELECT * FROM vendas WHERE id = $1 FOR UPDATE', [id]);
+    if (!antesResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Venda não encontrada' });
+    }
+
+    const valores = camposVendaDoBody(body, req);
 
     const result = await client.query(
       `
@@ -755,75 +922,49 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
           valor_repasse_imobiliaria = $24,
           documentacao_valor_cliente = $25,
           documentacao_valor_sobra = $26,
-          updated_by = $27,
+          captador_id = $27,
+          captador_nome = $28,
+          captador_tipo = $29,
+          captador_parceiro_nome = $30,
+          captacao_observacao = $31,
+          updated_by = $32,
           updated_at = NOW()
-      WHERE id = $28
+      WHERE id = $33
       RETURNING *
       `,
-      [
-        body.cliente,
-        body.cpfCliente || null,
-        body.empreendimentoRua || null,
-        body.numeroUnidade || null,
-        body.corretorId || null,
-        body.corretor || null,
-        body.corretor2Id || null,
-        body.corretor2 || null,
-        body.valorRepasseCorretor2 || 0,
-        normalizarSituacao(body.situacao),
-        body.captacao || 'Não',
-        body.valorCaptacao || 0,
-        body.valorComissaoTotal || 0,
-        body.nota || 'Não',
-        body.valorNota || 0,
-        body.assinaturaCcv || null,
-        body.fechador || 'Não',
-        body.valorFechador || 0,
-        body.irFuturo || 'Não',
-        body.valorImovelVenda || 0,
-        body.modalidadeImovel || '',
-        body.valorRepasseCorretor || 0,
-        body.valorRepasseGerencia || 0,
-        body.valorRepasseImobiliaria || 0,
-        body.documentacaoValorCliente || 0,
-        body.documentacaoValorSobra || 0,
-        req.user.id,
-        id
-      ]
+      [...valores, id]
     );
 
-    if (result.rows.length === 0) {
-      await client.query('ROLLBACK');
+    await salvarCorretoresVenda(client, id, [
+      { corretorId: body.corretorId, valorRepasse: body.valorRepasseCorretor },
+      { corretorId: body.corretor2Id, valorRepasse: body.valorRepasseCorretor2 }
+    ]);
 
-      return res.status(404).json({
-        message: 'Venda não encontrada'
-      });
-    }
+    const depoisResult = await client.query('SELECT * FROM vendas WHERE id = $1', [id]);
+    await registrarLogsAlteracao(client, id, req, antesResult.rows[0], depoisResult.rows[0]);
 
     await client.query('COMMIT');
-
-    await salvarCorretoresVenda(id, [
-      {
-        corretorId: body.corretorId,
-        valorRepasse: body.valorRepasseCorretor
-      },
-      {
-        corretorId: body.corretor2Id,
-        valorRepasse: body.valorRepasseCorretor2
-      }
-    ]);
 
     const vendaAtualizadaResult = await pool.query(
       `
       SELECT
         v.*,
-        COALESCE((
-          SELECT SUM(c.valor)
-          FROM usuarios_comprovantes c
-          WHERE c.venda_id = v.id
-        ), 0)::NUMERIC AS valor_pago_comprovantes,
-        0::NUMERIC AS saldo_pendente
+        COALESCE((SELECT SUM(c.valor) FROM usuarios_comprovantes c WHERE c.venda_id = v.id), 0)::NUMERIC AS valor_pago_comprovantes,
+        0::NUMERIC AS saldo_pendente,
+        COALESCE(ri.valor_recebido_imobiliaria, 0)::NUMERIC AS valor_recebido_imobiliaria,
+        GREATEST(COALESCE(v.valor_comissao_total, 0) - COALESCE(ri.valor_recebido_imobiliaria, 0), 0)::NUMERIC AS saldo_receber_imobiliaria,
+        CASE
+          WHEN COALESCE(ri.valor_recebido_imobiliaria, 0) <= 0 THEN 'Não pago'
+          WHEN COALESCE(ri.valor_recebido_imobiliaria, 0) >= COALESCE(v.valor_comissao_total, 0) THEN 'Pago'
+          ELSE 'Parcial'
+        END AS status_financeiro
       FROM vendas v
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(cr.valor_recebido), 0)::NUMERIC AS valor_recebido_imobiliaria
+        FROM contas_receber cr
+        WHERE cr.venda_id = v.id
+          AND cr.status IN ('Recebido', 'Parcial')
+      ) ri ON TRUE
       WHERE v.id = $1
       `,
       [id]
@@ -832,7 +973,6 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
     return res.json(mapVenda(vendaAtualizadaResult.rows[0], req));
   } catch (error) {
     await client.query('ROLLBACK');
-
     console.error(error);
 
     return res.status(500).json({
@@ -840,6 +980,58 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
     });
   } finally {
     client.release();
+  }
+});
+
+router.get('/:id/logs', somentePerfis('admin', 'gerente'), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const pertence = await vendaPertenceAoEscopo(req, id);
+    if (!pertence) {
+      return res.status(403).json({ message: 'Você não tem permissão para visualizar logs desta venda' });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        venda_id,
+        usuario_id,
+        usuario_nome,
+        acao,
+        campo,
+        valor_anterior,
+        valor_novo,
+        dados_anteriores,
+        dados_novos,
+        criado_em
+      FROM venda_logs
+      WHERE venda_id = $1
+      ORDER BY criado_em DESC
+      `,
+      [id]
+    );
+
+    return res.json(result.rows.map(row => ({
+      id: row.id,
+      vendaId: row.venda_id,
+      usuarioId: row.usuario_id,
+      usuarioNome: row.usuario_nome,
+      acao: row.acao,
+      campo: row.campo,
+      valorAnterior: row.valor_anterior,
+      valorNovo: row.valor_novo,
+      dadosAnteriores: row.dados_anteriores,
+      dadosNovos: row.dados_novos,
+      criadoEm: row.criado_em
+    })));
+  } catch (error) {
+    console.error(error);
+
+    return res.status(500).json({
+      message: 'Erro ao carregar logs da venda'
+    });
   }
 });
 
