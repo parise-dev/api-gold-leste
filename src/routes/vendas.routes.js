@@ -68,6 +68,7 @@ function montarFiltroEscopo(req, params, alias = 'v') {
         ${prefixo}corretor_id = $${idx}
         OR ${prefixo}corretor_2_id = $${idx}
         OR ${prefixo}captador_id = $${idx}
+        OR ${prefixo}puxador_id = $${idx}
         OR EXISTS (
           SELECT 1
           FROM venda_corretores vc_escopo
@@ -89,7 +90,7 @@ function montarFiltroEscopo(req, params, alias = 'v') {
         OR EXISTS (
           SELECT 1
           FROM usuarios c_escopo
-          WHERE c_escopo.id IN (${prefixo}corretor_id, ${prefixo}corretor_2_id, ${prefixo}captador_id)
+          WHERE c_escopo.id IN (${prefixo}corretor_id, ${prefixo}corretor_2_id, ${prefixo}captador_id, ${prefixo}puxador_id)
             AND c_escopo.gerente_id = $${idx}
         )
         OR EXISTS (
@@ -347,6 +348,10 @@ async function registrarLogsAlteracao(client, vendaId, req, vendaAntes, vendaDep
     ['captador_parceiro_nome', 'parceiro captação'],
     ['captacao_observacao', 'observação captação'],
     ['valor_captacao', 'valor captação'],
+    ['puxador_id', 'puxador'],
+    ['puxador_tipo', 'tipo puxador'],
+    ['puxador_parceiro_nome', 'parceiro puxador'],
+    ['puxador_observacao', 'observação puxador'],
     ['valor_comissao_total', 'comissão total'],
     ['valor_repasse_corretor', 'repasse corretor'],
     ['valor_repasse_corretor_2', 'repasse 2º corretor'],
@@ -395,6 +400,12 @@ function mapVenda(row, req) {
     captadorParceiroNome: row.captador_parceiro_nome,
     captacaoObservacao: row.captacao_observacao,
     valorCaptacao: dinheiro(row.valor_captacao),
+
+    puxadorId: row.puxador_id,
+    puxadorNome: row.puxador_nome,
+    puxadorTipo: row.puxador_tipo,
+    puxadorParceiroNome: row.puxador_parceiro_nome,
+    puxadorObservacao: row.puxador_observacao,
 
     valorComissaoTotal: dinheiro(row.valor_comissao_total),
 
@@ -458,6 +469,14 @@ function camposVendaDoBody(body, req) {
     ? (body.captadorNome || captadorParceiroNome || null)
     : null;
 
+  const puxadorAtivo = body.fechador === 'Sim';
+  const puxadorTipo = puxadorAtivo ? (body.puxadorTipo || 'corretor') : null;
+  const puxadorId = puxadorAtivo && puxadorTipo === 'corretor' ? (body.puxadorId || null) : null;
+  const puxadorParceiroNome = puxadorAtivo && puxadorTipo === 'parceiro' ? (body.puxadorParceiroNome || null) : null;
+  const puxadorNome = puxadorAtivo
+    ? (body.puxadorNome || puxadorParceiroNome || null)
+    : null;
+
   return [
     body.cliente,
     body.cpfCliente || null,
@@ -490,6 +509,11 @@ function camposVendaDoBody(body, req) {
     captadorTipo,
     captadorParceiroNome,
     captacaoAtiva ? (body.captacaoObservacao || null) : null,
+    puxadorId,
+    puxadorNome,
+    puxadorTipo,
+    puxadorParceiroNome,
+    puxadorAtivo ? (body.puxadorObservacao || null) : null,
     req.user.id
   ];
 }
@@ -524,6 +548,7 @@ router.get('/', async (req, res) => {
           v.corretor_id = $${params.length}
           OR v.corretor_2_id = $${params.length}
           OR v.captador_id = $${params.length}
+          OR v.puxador_id = $${params.length}
           OR EXISTS (
             SELECT 1
             FROM venda_corretores vc
@@ -545,6 +570,8 @@ router.get('/', async (req, res) => {
           OR LOWER(COALESCE(v.corretor_2_nome, '')) LIKE $${params.length}
           OR LOWER(COALESCE(v.captador_nome, '')) LIKE $${params.length}
           OR LOWER(COALESCE(v.captador_parceiro_nome, '')) LIKE $${params.length}
+          OR LOWER(COALESCE(v.puxador_nome, '')) LIKE $${params.length}
+          OR LOWER(COALESCE(v.puxador_parceiro_nome, '')) LIKE $${params.length}
           OR LOWER(COALESCE(v.numero_unidade, '')) LIKE $${params.length}
         )
       `);
@@ -702,6 +729,44 @@ router.get('/', async (req, res) => {
           END AS status_pagamento
         WHERE v.captador_id = $${usuarioParamIndex}
 
+        UNION ALL
+
+        SELECT
+          v.puxador_id,
+          COALESCE(v.puxador_nome, 'Puxador') AS corretor_nome,
+          COALESCE(v.valor_fechador, 0)::NUMERIC AS valor_repasse,
+          COALESCE((
+            SELECT SUM(c.valor)
+            FROM usuarios_comprovantes c
+            WHERE c.venda_id = v.id
+              AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+          ), 0)::NUMERIC AS valor_pago,
+          GREATEST(
+            COALESCE(v.valor_fechador, 0) - COALESCE((
+              SELECT SUM(c.valor)
+              FROM usuarios_comprovantes c
+              WHERE c.venda_id = v.id
+                AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+            ), 0),
+            0
+          )::NUMERIC AS saldo_pendente,
+          CASE
+            WHEN COALESCE((
+              SELECT SUM(c.valor)
+              FROM usuarios_comprovantes c
+              WHERE c.venda_id = v.id
+                AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+            ), 0) <= 0 THEN 'Pendente'
+            WHEN COALESCE((
+              SELECT SUM(c.valor)
+              FROM usuarios_comprovantes c
+              WHERE c.venda_id = v.id
+                AND (c.usuario_id = $${usuarioParamIndex} OR c.corretor_id = $${usuarioParamIndex})
+            ), 0) < COALESCE(v.valor_fechador, 0) THEN 'Parcial'
+            ELSE 'Pago'
+          END AS status_pagamento
+        WHERE v.puxador_id = $${usuarioParamIndex}
+
         LIMIT 1
       ) pu ON TRUE
 
@@ -746,7 +811,8 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
     const permissaoCorretores = await validarCorretoresExistem([
       { corretorId: body.corretorId },
       { corretorId: body.corretor2Id },
-      { corretorId: body.captadorTipo === 'corretor' ? body.captadorId : null }
+      { corretorId: body.captadorTipo === 'corretor' ? body.captadorId : null },
+      { corretorId: body.puxadorTipo === 'corretor' ? body.puxadorId : null }
     ]);
 
     if (!permissaoCorretores.ok) {
@@ -791,6 +857,11 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
         captador_tipo,
         captador_parceiro_nome,
         captacao_observacao,
+        puxador_id,
+        puxador_nome,
+        puxador_tipo,
+        puxador_parceiro_nome,
+        puxador_observacao,
         created_by,
         updated_by
       )
@@ -798,7 +869,7 @@ router.post('/', somentePerfis('admin', 'gerente'), async (req, res) => {
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
         $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
         $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
-        $31,$32,$32
+        $31,$32,$33,$34,$35,$36,$37,$37
       )
       RETURNING *
       `,
@@ -876,7 +947,8 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
     const permissaoCorretores = await validarCorretoresExistem([
       { corretorId: body.corretorId },
       { corretorId: body.corretor2Id },
-      { corretorId: body.captadorTipo === 'corretor' ? body.captadorId : null }
+      { corretorId: body.captadorTipo === 'corretor' ? body.captadorId : null },
+      { corretorId: body.puxadorTipo === 'corretor' ? body.puxadorId : null }
     ]);
 
     if (!permissaoCorretores.ok) {
@@ -927,9 +999,14 @@ router.put('/:id', somentePerfis('admin', 'gerente'), async (req, res) => {
           captador_tipo = $29,
           captador_parceiro_nome = $30,
           captacao_observacao = $31,
-          updated_by = $32,
+          puxador_id = $32,
+          puxador_nome = $33,
+          puxador_tipo = $34,
+          puxador_parceiro_nome = $35,
+          puxador_observacao = $36,
+          updated_by = $37,
           updated_at = NOW()
-      WHERE id = $33
+      WHERE id = $38
       RETURNING *
       `,
       [...valores, id]

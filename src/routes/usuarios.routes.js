@@ -277,13 +277,14 @@ async function corretorPertenceVenda(vendaId, usuarioId) {
         v.corretor_id = $2
         OR v.corretor_2_id = $2
         OR v.captador_id = $2
+        OR v.puxador_id = $2
       )
 
     UNION
 
     SELECT 1
     FROM vendas v
-    INNER JOIN usuarios c ON c.id IN (v.corretor_id, v.corretor_2_id, v.captador_id)
+    INNER JOIN usuarios c ON c.id IN (v.corretor_id, v.corretor_2_id, v.captador_id, v.puxador_id)
     WHERE v.id = $1
       AND c.gerente_id = $2
 
@@ -329,9 +330,10 @@ async function recalcularStatusComissaoVendaCorretor(vendaId, usuarioId) {
     SELECT
       CASE
         WHEN v.captador_id = $2 THEN COALESCE(v.valor_captacao, 0)
+        WHEN v.puxador_id = $2 THEN COALESCE(v.valor_fechador, 0)
         ELSE COALESCE(vc.valor_repasse, v.valor_repasse_corretor, 0)
       END::NUMERIC AS valor_repasse,
-      CASE WHEN v.captador_id = $2 THEN TRUE ELSE FALSE END AS eh_captador
+      CASE WHEN v.captador_id = $2 OR v.puxador_id = $2 THEN TRUE ELSE FALSE END AS eh_captador
     FROM vendas v
     LEFT JOIN venda_corretores vc
       ON vc.venda_id = v.id

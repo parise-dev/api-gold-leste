@@ -62,6 +62,7 @@ function montarFiltrosDashboard(req, alias = '') {
         ${prefixo}corretor_id = $${idx}
         OR ${prefixo}corretor_2_id = $${idx}
         OR ${prefixo}captador_id = $${idx}
+        OR ${prefixo}puxador_id = $${idx}
         OR EXISTS (
           SELECT 1
           FROM venda_corretores vc
@@ -83,7 +84,7 @@ function montarFiltrosDashboard(req, alias = '') {
         OR EXISTS (
           SELECT 1
           FROM usuarios c
-          WHERE c.id IN (${prefixo}corretor_id, ${prefixo}corretor_2_id, ${prefixo}captador_id)
+          WHERE c.id IN (${prefixo}corretor_id, ${prefixo}corretor_2_id, ${prefixo}captador_id, ${prefixo}puxador_id)
             AND c.gerente_id = $${idx}
         )
         OR EXISTS (
@@ -160,10 +161,23 @@ router.get('/resumo', async (req, res) => {
           AND COALESCE(vb.valor_captacao, 0) > 0
       ),
 
+      puxadores AS (
+        SELECT
+          vb.id AS venda_id,
+          vb.puxador_id AS corretor_id,
+          COALESCE(vb.valor_fechador, 0)::NUMERIC AS valor_repasse
+        FROM vendas_base vb
+        WHERE vb.fechador = 'Sim'
+          AND vb.puxador_id IS NOT NULL
+          AND COALESCE(vb.valor_fechador, 0) > 0
+      ),
+
       repasses_usuario AS (
         SELECT venda_id, corretor_id, valor_repasse, 'venda' AS tipo FROM vendedores
         UNION ALL
         SELECT venda_id, corretor_id, valor_repasse, 'captacao' AS tipo FROM captacoes
+        UNION ALL
+        SELECT venda_id, corretor_id, valor_repasse, 'puxador' AS tipo FROM puxadores
       ),
 
       repasses_por_venda AS (
@@ -392,6 +406,21 @@ router.get('/ranking-corretores', async (req, res) => {
         WHERE vb.captacao = 'Sim'
           AND vb.captador_id IS NOT NULL
           AND COALESCE(vb.valor_captacao, 0) > 0
+
+        UNION ALL
+
+        SELECT
+          vb.puxador_id AS corretor_id,
+          vb.id AS venda_id,
+          vb.situacao,
+          0::NUMERIC AS valor_imovel_venda,
+          0::NUMERIC AS valor_comissao_total,
+          COALESCE(vb.valor_fechador, 0)::NUMERIC AS valor_repasse,
+          'puxador' AS tipo
+        FROM vendas_base vb
+        WHERE vb.fechador = 'Sim'
+          AND vb.puxador_id IS NOT NULL
+          AND COALESCE(vb.valor_fechador, 0) > 0
       )
 
       SELECT
@@ -654,6 +683,13 @@ router.get('/comissoes-mes', async (req, res) => {
         FROM vendas_base vb
         WHERE vb.captacao = 'Sim'
           AND vb.captador_id IS NOT NULL
+
+        UNION ALL
+
+        SELECT vb.id, vb.puxador_id, COALESCE(vb.valor_fechador, 0)::NUMERIC
+        FROM vendas_base vb
+        WHERE vb.fechador = 'Sim'
+          AND vb.puxador_id IS NOT NULL
       ),
 
       repasses_por_venda AS (
