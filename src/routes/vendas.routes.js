@@ -442,18 +442,24 @@ function mapVenda(row, req) {
 
   if (!isCorretor) return base;
 
-  return {
-    ...base,
-    corretorId: row.usuario_corretor_id || row.corretor_id,
-    corretor: row.usuario_corretor_nome || row.corretor_nome || 'Corretor',
-    valorComissaoTotal: dinheiro(row.valor_repasse_usuario),
-    valorRepasseCorretor: dinheiro(row.valor_repasse_usuario),
-    valorRepasseGerencia: 0,
-    valorRepasseImobiliaria: 0,
-    valorPagoComprovantes: dinheiro(row.valor_pago_usuario),
-    saldoPendente: dinheiro(row.saldo_pendente_usuario),
-    statusComissaoCorretor: row.status_pagamento_usuario || row.status_comissao_corretor
-  };
+return {
+  ...base,
+
+  // Mantém os dados reais da venda:
+  // corretor principal continua sendo o verdadeiro vendedor,
+  // 2º corretor continua como 2º,
+  // captador continua como captação,
+  // puxador continua como puxador.
+
+  meuRepasse: dinheiro(row.valor_repasse_usuario),
+  meuValorPago: dinheiro(row.valor_pago_usuario),
+  meuSaldoPendente: dinheiro(row.saldo_pendente_usuario),
+  meuStatusPagamento: row.status_pagamento_usuario || row.status_comissao_corretor,
+
+  valorPagoComprovantes: dinheiro(row.valor_pago_usuario),
+  saldoPendente: dinheiro(row.saldo_pendente_usuario),
+  statusComissaoCorretor: row.status_pagamento_usuario || row.status_comissao_corretor
+};
 }
 
 function camposVendaDoBody(body, req) {
