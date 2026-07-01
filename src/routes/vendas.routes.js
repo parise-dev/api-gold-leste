@@ -530,7 +530,8 @@ router.get('/', async (req, res) => {
       dataFim,
       corretorId,
       statusComissao,
-      vendaId
+      vendaId,
+      tipoParticipacao
     } = req.query;
 
     const params = [];
@@ -560,6 +561,60 @@ router.get('/', async (req, res) => {
         )
       `);
     }
+
+    if (tipoParticipacao) {
+  const tipo = String(tipoParticipacao).toLowerCase();
+
+  if (req.user.perfil === 'corretor') {
+    params.push(req.user.id);
+    const idx = params.length;
+
+    if (tipo === 'principal') {
+      where.push(`v.corretor_id = $${idx}`);
+    }
+
+    if (tipo === 'segundo') {
+      where.push(`v.corretor_2_id = $${idx}`);
+    }
+
+    if (tipo === 'captacao') {
+      where.push(`v.captador_id = $${idx}`);
+    }
+  } else if (corretorId) {
+    params.push(corretorId);
+    const idx = params.length;
+
+    if (tipo === 'principal') {
+      where.push(`v.corretor_id = $${idx}`);
+    }
+
+    if (tipo === 'segundo') {
+      where.push(`v.corretor_2_id = $${idx}`);
+    }
+
+    if (tipo === 'captacao') {
+      where.push(`v.captador_id = $${idx}`);
+    }
+  } else {
+    if (tipo === 'principal') {
+      where.push(`v.corretor_id IS NOT NULL`);
+    }
+
+    if (tipo === 'segundo') {
+      where.push(`v.corretor_2_id IS NOT NULL`);
+    }
+
+    if (tipo === 'captacao') {
+      where.push(`
+        (
+          v.captador_id IS NOT NULL
+          OR v.captador_tipo = 'parceiro'
+          OR COALESCE(v.valor_captacao, 0) > 0
+        )
+      `);
+    }
+  }
+}
 
     if (busca) {
       params.push(`%${String(busca).toLowerCase()}%`);

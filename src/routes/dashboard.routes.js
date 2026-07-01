@@ -106,6 +106,7 @@ function montarFiltrosDashboard(req, alias = '') {
 
 function wherePeriodoSql(req, alias = 'v') {
   const { params, where } = montarFiltrosPeriodo(req, alias);
+
   return {
     params,
     whereSql: where.length ? `WHERE ${where.join(' AND ')}` : ''
@@ -183,11 +184,18 @@ router.get('/resumo', async (req, res) => {
       repasses_por_venda AS (
         SELECT
           r.venda_id,
+
           COALESCE(SUM(r.valor_repasse), 0)::NUMERIC AS total_repasse_corretores_e_captacao,
+
           COALESCE(SUM(r.valor_repasse) FILTER (WHERE r.tipo = 'captacao'), 0)::NUMERIC AS total_repasse_captacao,
+
           COALESCE(SUM(r.valor_repasse) FILTER (WHERE r.corretor_id = $${usuarioParamIndex}), 0)::NUMERIC AS repasse_usuario,
+
           BOOL_OR(r.tipo = 'venda' AND r.corretor_id = $${usuarioParamIndex}) AS usuario_vendeu,
-          BOOL_OR(r.tipo = 'captacao' AND r.corretor_id = $${usuarioParamIndex}) AS usuario_captou
+
+          BOOL_OR(r.tipo = 'captacao' AND r.corretor_id = $${usuarioParamIndex}) AS usuario_captou,
+
+          BOOL_OR(r.tipo = 'puxador' AND r.corretor_id = $${usuarioParamIndex}) AS usuario_puxou
         FROM repasses_usuario r
         GROUP BY r.venda_id
       ),
@@ -237,31 +245,102 @@ router.get('/resumo', async (req, res) => {
 
       SELECT
         COUNT(vb.id)::INT AS total_vendas_geral,
-        COUNT(vb.id) FILTER (WHERE COALESCE(rpv.usuario_vendeu, false))::INT AS total_vendas_usuario,
 
-        COUNT(vb.id) FILTER (WHERE vb.situacao = 'Concluído' OR vb.situacao = 'Concluido')::INT AS total_concluidas_geral,
+        COUNT(vb.id) FILTER (
+          WHERE COALESCE(rpv.usuario_vendeu, false)
+        )::INT AS total_vendas_usuario,
+
+        COUNT(vb.id) FILTER (
+          WHERE COALESCE(rpv.usuario_captou, false)
+        )::INT AS total_captacoes_usuario,
+
+        COUNT(vb.id) FILTER (
+          WHERE vb.captacao = 'Sim'
+            AND COALESCE(vb.valor_captacao, 0) > 0
+        )::INT AS total_captacoes_geral,
+
+        COALESCE(SUM(
+          CASE
+            WHEN COALESCE(rpv.usuario_captou, false)
+            THEN COALESCE(vb.valor_captacao, 0)
+            ELSE 0
+          END
+        ), 0)::NUMERIC AS total_valor_captacao_usuario,
+
+        COALESCE(SUM(
+          CASE
+            WHEN vb.captacao = 'Sim'
+              AND COALESCE(vb.valor_captacao, 0) > 0
+            THEN COALESCE(vb.valor_captacao, 0)
+            ELSE 0
+          END
+        ), 0)::NUMERIC AS total_valor_captacao_geral,
+
+        COUNT(vb.id) FILTER (
+          WHERE vb.situacao = 'Concluído'
+             OR vb.situacao = 'Concluido'
+        )::INT AS total_concluidas_geral,
+
         COUNT(vb.id) FILTER (
           WHERE (vb.situacao = 'Concluído' OR vb.situacao = 'Concluido')
             AND COALESCE(rpv.usuario_vendeu, false)
         )::INT AS total_concluidas_usuario,
 
-        COUNT(vb.id) FILTER (WHERE vb.situacao = 'Em processo')::INT AS total_em_processo_geral,
-        COUNT(vb.id) FILTER (WHERE vb.situacao = 'IR Futuro')::INT AS total_ir_futuro_geral,
-        COUNT(vb.id) FILTER (WHERE vb.situacao = 'Distrato')::INT AS total_distrato_geral,
+        COUNT(vb.id) FILTER (
+          WHERE vb.situacao = 'Em processo'
+        )::INT AS total_em_processo_geral,
+
+        COUNT(vb.id) FILTER (
+          WHERE vb.situacao = 'Em processo'
+            AND COALESCE(rpv.usuario_vendeu, false)
+        )::INT AS total_em_processo_usuario,
+
+        COUNT(vb.id) FILTER (
+          WHERE vb.situacao = 'IR Futuro'
+        )::INT AS total_ir_futuro_geral,
+
+        COUNT(vb.id) FILTER (
+          WHERE vb.situacao = 'IR Futuro'
+            AND COALESCE(rpv.usuario_vendeu, false)
+        )::INT AS total_ir_futuro_usuario,
+
+        COUNT(vb.id) FILTER (
+          WHERE vb.situacao = 'Distrato'
+        )::INT AS total_distrato_geral,
+
+        COUNT(vb.id) FILTER (
+          WHERE vb.situacao = 'Distrato'
+            AND COALESCE(rpv.usuario_vendeu, false)
+        )::INT AS total_distrato_usuario,
 
         COALESCE(SUM(vb.valor_comissao_total), 0)::NUMERIC AS total_comissao_bruta,
-        COALESCE(SUM(vb.valor_imovel_venda), 0)::NUMERIC AS total_vendido,
+
+        COALESCE(SUM(vb.valor_imovel_venda), 0)::NUMERIC AS total_vendido_geral,
+
+        COALESCE(SUM(
+          CASE
+            WHEN COALESCE(rpv.usuario_vendeu, false)
+            THEN COALESCE(vb.valor_imovel_venda, 0)
+            ELSE 0
+          END
+        ), 0)::NUMERIC AS total_vendido_usuario,
 
         COALESCE(SUM(COALESCE(rpv.total_repasse_corretores_e_captacao, 0)), 0)::NUMERIC AS total_repasse_corretores,
+
         COALESCE(SUM(COALESCE(rpv.total_repasse_captacao, 0)), 0)::NUMERIC AS total_repasse_captacao,
+
         COALESCE(SUM(COALESCE(rpv.repasse_usuario, 0)), 0)::NUMERIC AS repasse_usuario,
 
         COALESCE(SUM(vb.valor_repasse_gerencia), 0)::NUMERIC AS total_repasse_gerencia,
+
         COALESCE(SUM(vb.valor_repasse_imobiliaria), 0)::NUMERIC AS total_repasse_imobiliaria,
 
         COALESCE(SUM(COALESCE(pu.total_pago, 0)), 0)::NUMERIC AS pago_usuario,
+
         COALESCE(SUM(COALESCE(pc.total_pago, 0)), 0)::NUMERIC AS pago_corretores,
+
         COALESCE(SUM(COALESCE(pg.total_pago, 0)), 0)::NUMERIC AS pago_gerencia,
+
         COALESCE(SUM(COALESCE(ri.total_recebido, 0)), 0)::NUMERIC AS total_recebido_imobiliaria
 
       FROM vendas_base vb
@@ -289,10 +368,19 @@ router.get('/resumo', async (req, res) => {
     const pagoGerencia = Number(row.pago_gerencia || 0);
     const totalRecebidoImobiliaria = Number(row.total_recebido_imobiliaria || 0);
 
+    const totalCaptacoesUsuario = Number(row.total_captacoes_usuario || 0);
+    const totalCaptacoesGeral = Number(row.total_captacoes_geral || 0);
+
+    const totalValorCaptacaoUsuario = Number(row.total_valor_captacao_usuario || 0);
+    const totalValorCaptacaoGeral = Number(row.total_valor_captacao_geral || 0);
+
     let totalComissao = totalComissaoBruta;
     let totalRepasseCorretor = totalRepasseCorretores;
     let comissaoPaga = pagoCorretores + pagoGerencia;
-    let comissaoAReceber = Math.max(totalRepasseCorretores + totalRepasseGerencia - pagoCorretores - pagoGerencia, 0);
+    let comissaoAReceber = Math.max(
+      totalRepasseCorretores + totalRepasseGerencia - pagoCorretores - pagoGerencia,
+      0
+    );
 
     if (perfil === 'gerente') {
       totalComissao = totalRepasseGerencia;
@@ -309,33 +397,77 @@ router.get('/resumo', async (req, res) => {
     }
 
     return res.json({
-      totalVendas: perfil === 'corretor' ? Number(row.total_vendas_usuario || 0) : Number(row.total_vendas_geral || 0),
-      totalConcluidas: perfil === 'corretor' ? Number(row.total_concluidas_usuario || 0) : Number(row.total_concluidas_geral || 0),
-      totalEmProcesso: Number(row.total_em_processo_geral || 0),
-      totalIrFuturo: Number(row.total_ir_futuro_geral || 0),
-      totalDistrato: Number(row.total_distrato_geral || 0),
+      totalVendas: perfil === 'corretor'
+        ? Number(row.total_vendas_usuario || 0)
+        : Number(row.total_vendas_geral || 0),
+
+      totalConcluidas: perfil === 'corretor'
+        ? Number(row.total_concluidas_usuario || 0)
+        : Number(row.total_concluidas_geral || 0),
+
+      totalEmProcesso: perfil === 'corretor'
+        ? Number(row.total_em_processo_usuario || 0)
+        : Number(row.total_em_processo_geral || 0),
+
+      totalIrFuturo: perfil === 'corretor'
+        ? Number(row.total_ir_futuro_usuario || 0)
+        : Number(row.total_ir_futuro_geral || 0),
+
+      totalDistrato: perfil === 'corretor'
+        ? Number(row.total_distrato_usuario || 0)
+        : Number(row.total_distrato_geral || 0),
+
+      totalCaptacoes: perfil === 'corretor'
+        ? totalCaptacoesUsuario
+        : totalCaptacoesGeral,
+
+      totalValorCaptacaoUsuario: perfil === 'corretor'
+        ? totalValorCaptacaoUsuario
+        : totalValorCaptacaoGeral,
 
       totalComissao,
-      totalVendido: Number(row.total_vendido || 0),
+
+      totalVendido: perfil === 'corretor'
+        ? Number(row.total_vendido_usuario || 0)
+        : Number(row.total_vendido_geral || 0),
 
       totalRepasseCorretor,
       totalRepasseGerencia,
       totalRepasseImobiliaria,
-      totalRepasseCaptacao,
+
+      totalRepasseCaptacao: perfil === 'corretor'
+        ? totalValorCaptacaoUsuario
+        : totalRepasseCaptacao,
+
       totalPagoCaptacao: 0,
-      totalPendenteCaptacao: totalRepasseCaptacao,
+
+      totalPendenteCaptacao: perfil === 'corretor'
+        ? totalValorCaptacaoUsuario
+        : totalRepasseCaptacao,
 
       comissaoAReceber,
       comissaoPaga,
 
       totalRecebidoImobiliaria,
-      totalFaltaReceberImobiliaria: Math.max(totalComissaoBruta - totalRecebidoImobiliaria, 0),
+
+      totalFaltaReceberImobiliaria: Math.max(
+        totalComissaoBruta - totalRecebidoImobiliaria,
+        0
+      ),
 
       totalPagoCorretores: pagoCorretores,
-      totalPendenteCorretores: Math.max(totalRepasseCorretores - pagoCorretores, 0),
+
+      totalPendenteCorretores: Math.max(
+        totalRepasseCorretores - pagoCorretores,
+        0
+      ),
 
       totalPagoGerencia: pagoGerencia,
-      totalPendenteGerencia: Math.max(totalRepasseGerencia - pagoGerencia, 0),
+
+      totalPendenteGerencia: Math.max(
+        totalRepasseGerencia - pagoGerencia,
+        0
+      ),
 
       resultadoPrevistoImobiliaria: totalComissaoBruta,
       resultadoRecebidoImobiliaria: totalRecebidoImobiliaria
@@ -429,17 +561,24 @@ router.get('/ranking-corretores', async (req, res) => {
         g.nome AS gerente_nome,
 
         COUNT(v.venda_id) FILTER (WHERE v.tipo = 'venda')::INT AS total_vendas,
+
         COUNT(v.venda_id) FILTER (
           WHERE v.tipo = 'venda'
             AND (v.situacao = 'Concluído' OR v.situacao = 'Concluido')
         )::INT AS vendas_concluidas,
 
         COALESCE(SUM(v.valor_imovel_venda) FILTER (WHERE v.tipo = 'venda'), 0)::NUMERIC AS total_vendido,
+
         COALESCE(SUM(v.valor_comissao_total) FILTER (WHERE v.tipo = 'venda'), 0)::NUMERIC AS total_comissao,
+
         COALESCE(SUM(v.valor_repasse), 0)::NUMERIC AS total_repasse,
 
         COALESCE(SUM(pg.total_pago), 0)::NUMERIC AS comissao_paga,
-        GREATEST(COALESCE(SUM(v.valor_repasse), 0) - COALESCE(SUM(pg.total_pago), 0), 0)::NUMERIC AS comissao_a_receber
+
+        GREATEST(
+          COALESCE(SUM(v.valor_repasse), 0) - COALESCE(SUM(pg.total_pago), 0),
+          0
+        )::NUMERIC AS comissao_a_receber
 
       FROM vendedores v
       INNER JOIN usuarios u ON u.id = v.corretor_id
@@ -499,10 +638,16 @@ router.get('/ranking-captacao', async (req, res) => {
         COUNT(vb.id)::INT AS total_captacoes,
         COALESCE(SUM(vb.valor_captacao), 0)::NUMERIC AS total_valor_captacao,
         COALESCE(SUM(pg.total_pago), 0)::NUMERIC AS total_pago,
-        GREATEST(COALESCE(SUM(vb.valor_captacao), 0) - COALESCE(SUM(pg.total_pago), 0), 0)::NUMERIC AS total_pendente
+
+        GREATEST(
+          COALESCE(SUM(vb.valor_captacao), 0) - COALESCE(SUM(pg.total_pago), 0),
+          0
+        )::NUMERIC AS total_pendente
+
       FROM vendas_base vb
       LEFT JOIN usuarios u ON u.id = vb.captador_id
       LEFT JOIN usuarios g ON g.id = u.gerente_id
+
       LEFT JOIN LATERAL (
         SELECT COALESCE(SUM(uc.valor), 0)::NUMERIC AS total_pago
         FROM usuarios_comprovantes uc
@@ -510,10 +655,19 @@ router.get('/ranking-captacao', async (req, res) => {
           AND vb.captador_id IS NOT NULL
           AND (uc.usuario_id = vb.captador_id OR uc.corretor_id = vb.captador_id)
       ) pg ON TRUE
+
       WHERE vb.captacao = 'Sim'
         AND COALESCE(vb.valor_captacao, 0) > 0
-        AND (vb.captador_id IS NOT NULL OR COALESCE(vb.captador_nome, vb.captador_parceiro_nome) IS NOT NULL)
-      GROUP BY u.id, COALESCE(u.nome, vb.captador_nome, vb.captador_parceiro_nome, 'Captação'), g.nome
+        AND (
+          vb.captador_id IS NOT NULL
+          OR COALESCE(vb.captador_nome, vb.captador_parceiro_nome) IS NOT NULL
+        )
+
+      GROUP BY
+        u.id,
+        COALESCE(u.nome, vb.captador_nome, vb.captador_parceiro_nome, 'Captação'),
+        g.nome
+
       ORDER BY total_valor_captacao DESC, total_captacoes DESC
       LIMIT 20
       `,
@@ -664,29 +818,44 @@ router.get('/comissoes-mes', async (req, res) => {
       ),
 
       repasses AS (
-        SELECT vc.venda_id, vc.corretor_id, COALESCE(vc.valor_repasse, 0)::NUMERIC AS valor_repasse
+        SELECT
+          vc.venda_id,
+          vc.corretor_id,
+          COALESCE(vc.valor_repasse, 0)::NUMERIC AS valor_repasse
         FROM venda_corretores vc
         INNER JOIN vendas_base vb ON vb.id = vc.venda_id
 
         UNION ALL
 
-        SELECT vb.id, vb.corretor_id, COALESCE(vb.valor_repasse_corretor, 0)::NUMERIC
+        SELECT
+          vb.id,
+          vb.corretor_id,
+          COALESCE(vb.valor_repasse_corretor, 0)::NUMERIC
         FROM vendas_base vb
         WHERE vb.corretor_id IS NOT NULL
           AND NOT EXISTS (
-            SELECT 1 FROM venda_corretores vc WHERE vc.venda_id = vb.id AND vc.corretor_id = vb.corretor_id
+            SELECT 1
+            FROM venda_corretores vc
+            WHERE vc.venda_id = vb.id
+              AND vc.corretor_id = vb.corretor_id
           )
 
         UNION ALL
 
-        SELECT vb.id, vb.captador_id, COALESCE(vb.valor_captacao, 0)::NUMERIC
+        SELECT
+          vb.id,
+          vb.captador_id,
+          COALESCE(vb.valor_captacao, 0)::NUMERIC
         FROM vendas_base vb
         WHERE vb.captacao = 'Sim'
           AND vb.captador_id IS NOT NULL
 
         UNION ALL
 
-        SELECT vb.id, vb.puxador_id, COALESCE(vb.valor_fechador, 0)::NUMERIC
+        SELECT
+          vb.id,
+          vb.puxador_id,
+          COALESCE(vb.valor_fechador, 0)::NUMERIC
         FROM vendas_base vb
         WHERE vb.fechador = 'Sim'
           AND vb.puxador_id IS NOT NULL
