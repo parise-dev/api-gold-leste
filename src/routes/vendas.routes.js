@@ -240,10 +240,6 @@ async function sincronizarCamposLegadosVenda(client, vendaId) {
   const principal = result.rows[0] || null;
   const segundo = result.rows[1] || null;
 
-  const totalRepasse = result.rows.reduce((total, item) => {
-    return total + dinheiro(item.valor_repasse);
-  }, 0);
-
   await client.query(
     `
     UPDATE vendas
@@ -262,7 +258,7 @@ async function sincronizarCamposLegadosVenda(client, vendaId) {
       segundo?.corretor_id || null,
       segundo?.corretor_nome || null,
       dinheiro(segundo?.valor_repasse),
-      totalRepasse,
+      dinheiro(principal?.valor_repasse),
       vendaId
     ]
   );
