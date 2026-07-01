@@ -532,14 +532,6 @@ router.get('/gerentes', somentePerfis('admin', 'gerente'), async (req, res) => {
 
 router.get('/corretores', somentePerfis('admin', 'gerente'), async (req, res) => {
   try {
-    const params = [];
-    let whereGerente = '';
-
-    if (req.user.perfil === 'gerente') {
-      params.push(req.user.id);
-      whereGerente = `AND u.gerente_id = $${params.length}`;
-    }
-
     const result = await pool.query(
       `
       SELECT
@@ -552,10 +544,10 @@ router.get('/corretores', somentePerfis('admin', 'gerente'), async (req, res) =>
       LEFT JOIN usuarios g ON g.id = u.gerente_id
       WHERE u.perfil = 'corretor'
         AND u.ativo = TRUE
-        ${whereGerente}
-      ORDER BY u.nome ASC
-      `,
-      params
+      ORDER BY
+        COALESCE(g.nome, 'Sem gerente') ASC,
+        u.nome ASC
+      `
     );
 
     return res.json(result.rows.map(row => ({
@@ -565,7 +557,8 @@ router.get('/corretores', somentePerfis('admin', 'gerente'), async (req, res) =>
       email: row.email,
       gerenteId: row.gerente_id,
       managerId: row.gerente_id,
-      gerenteNome: row.gerente_nome
+      gerenteNome: row.gerente_nome || 'Sem gerente',
+      gerente_nome: row.gerente_nome || 'Sem gerente'
     })));
   } catch (error) {
     console.error(error);
