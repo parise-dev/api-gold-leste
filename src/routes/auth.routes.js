@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { authMiddleware } = require('../middlewares/auth.middleware');
+const distribuicao = require('../services/lead-distribution.service');
 
 const router = express.Router();
 
@@ -68,6 +69,15 @@ router.post('/login', async (req, res) => {
       `,
       [usuario.id]
     );
+
+    // Entrada na fila de leads já no login (corretor entra no fim).
+    // Falha aqui nunca pode impedir o login — por exemplo enquanto o
+    // script sql/20260830_fila_leads.sql ainda não tiver sido executado.
+    try {
+      await distribuicao.registrarPresenca({ id: usuario.id, nome: usuario.nome });
+    } catch (erroFila) {
+      console.error('[auth] Falha ao registrar presença na fila:', erroFila.message);
+    }
 
     const token = jwt.sign(
       {
@@ -226,6 +236,21 @@ router.post('/trocar-senha-primeiro-acesso', authMiddleware, async (req, res) =>
       message: 'Erro ao trocar senha'
     });
   }
+});
+
+/**
+ * Logout: tira o usuário da presença imediatamente, sem esperar o
+ * timeout do heartbeat. Idempotente e tolerante a falha — o cliente
+ * limpa o token de qualquer forma.
+ */
+router.post('/logout', authMiddleware, async (req, res) => {
+  try {
+    await distribuicao.registrarSaida(req.user);
+  } catch (error) {
+    console.error('[auth] Falha ao remover presença no logout:', error.message);
+  }
+
+  return res.json({ message: 'Sessão encerrada.' });
 });
 
 router.post('/seed-admin', async (req, res) => {

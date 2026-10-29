@@ -1,6 +1,11 @@
 const express = require('express');
 const pool = require('../config/db');
 const { authMiddleware, somentePerfis } = require('../middlewares/auth.middleware');
+const {
+  calcularComissaoLiquida,
+  calcularValorNota,
+  possuiNota
+} = require('../utils/comissao');
 
 const router = express.Router();
 
@@ -43,12 +48,28 @@ function totalDistribuido(body) {
 
 function validarTotalRepasses(body) {
   const totalComissao = dinheiro(body.valorComissaoTotal);
+  const valorNota = calcularValorNota(body.nota, body.valorNota);
+  const comissaoLiquida = calcularComissaoLiquida(totalComissao, body.nota, body.valorNota);
   const distribuido = totalDistribuido(body);
 
-  if (distribuido > totalComissao + 0.01) {
+  if (possuiNota(body.nota) && valorNota <= 0) {
     return {
       ok: false,
-      message: 'A soma dos repasses não pode ser maior que a comissão total.'
+      message: 'Informe um valor de nota maior que zero.'
+    };
+  }
+
+  if (possuiNota(body.nota) && valorNota > totalComissao + 0.01) {
+    return {
+      ok: false,
+      message: 'O valor da nota não pode ser maior que a comissão total.'
+    };
+  }
+
+  if (distribuido > comissaoLiquida + 0.01) {
+    return {
+      ok: false,
+      message: 'A soma dos repasses não pode ser maior que a comissão líquida após o desconto da nota.'
     };
   }
 
@@ -349,6 +370,8 @@ async function registrarLogsAlteracao(client, vendaId, req, vendaAntes, vendaDep
     ['puxador_parceiro_nome', 'parceiro puxador'],
     ['puxador_observacao', 'observação puxador'],
     ['valor_comissao_total', 'comissão total'],
+    ['nota', 'nota'],
+    ['valor_nota', 'valor da nota'],
     ['valor_repasse_corretor', 'repasse corretor'],
     ['valor_repasse_corretor_2', 'repasse 2º corretor'],
     ['valor_repasse_gerencia', 'repasse gerência'],
@@ -372,6 +395,8 @@ async function registrarLogsAlteracao(client, vendaId, req, vendaAntes, vendaDep
 function mapVenda(row, req) {
   const isCorretor = req?.user?.perfil === 'corretor';
   const statusFinanceiro = row.status_financeiro || calcularStatusFinanceiro(row.valor_comissao_total, row.valor_recebido_imobiliaria);
+  const valorNota = calcularValorNota(row.nota, row.valor_nota);
+  const valorComissaoLiquida = calcularComissaoLiquida(row.valor_comissao_total, row.nota, row.valor_nota);
 
   const base = {
     id: row.id,
@@ -404,9 +429,10 @@ function mapVenda(row, req) {
     puxadorObservacao: row.puxador_observacao,
 
     valorComissaoTotal: dinheiro(row.valor_comissao_total),
+    valorComissaoLiquida,
 
     nota: row.nota,
-    valorNota: dinheiro(row.valor_nota),
+    valorNota,
 
     assinaturaCcv: row.assinatura_ccv,
 
@@ -478,6 +504,7 @@ function camposVendaDoBody(body, req) {
   const puxadorNome = puxadorAtivo
     ? (body.puxadorNome || puxadorParceiroNome || null)
     : null;
+  const notaAtiva = possuiNota(body.nota);
 
   return [
     body.cliente,
@@ -493,8 +520,8 @@ function camposVendaDoBody(body, req) {
     captacaoAtiva ? 'Sim' : 'Não',
     dinheiro(captacaoAtiva ? body.valorCaptacao : 0),
     dinheiro(body.valorComissaoTotal),
-    body.nota || 'Não',
-    dinheiro(body.valorNota),
+    notaAtiva ? 'Sim' : 'Não',
+    calcularValorNota(body.nota, body.valorNota),
     body.assinaturaCcv || null,
     body.fechador || 'Não',
     dinheiro(body.valorFechador),

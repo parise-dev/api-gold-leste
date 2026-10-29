@@ -38,7 +38,9 @@ async function authMiddleware(req, res, next) {
         nome,
         email,
         perfil,
-        ativo
+        ativo,
+        filial_id,
+        gerente_id
       FROM usuarios
       WHERE id = $1
       LIMIT 1
@@ -60,11 +62,16 @@ async function authMiddleware(req, res, next) {
       });
     }
 
+    // filialId/gerenteId fazem parte do escopo de acesso (ex.: um gerente
+    // edita imóveis da própria filial). Sem eles a regra de permissão
+    // nunca conseguia comparar a filial e o gerente ficava sem acesso.
     req.user = {
       id: usuario.id,
       nome: usuario.nome,
       email: usuario.email,
-      perfil: usuario.perfil
+      perfil: usuario.perfil,
+      filialId: usuario.filial_id || null,
+      gerenteId: usuario.gerente_id || null
     };
 
     next();

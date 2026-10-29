@@ -5,16 +5,22 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "migrate:cliente": "node scripts/migrate-ajustes-cliente.js"
+    "migrate:cliente": "node scripts/migrate-ajustes-cliente.js",
+    "importar:kenlo": "node scripts/importar-kenlo-site.js",
+    "validar:feeds": "node scripts/validar-feeds-exemplo.js",
+    "testar:fila": "node scripts/simular-fila-leads.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.18.3",
+    "express-rate-limit": "^8.6.2",
     "jsonwebtoken": "^9.0.2",
+    "minio": "^8.0.7",
     "multer": "^2.2.0",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"
