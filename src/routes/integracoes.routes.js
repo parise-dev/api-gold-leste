@@ -16,6 +16,37 @@ const router = express.Router();
 router.use(authMiddleware);
 router.use(somentePerfis('admin'));
 
+router.get('/portais/:id/feed/previa', asyncHandler(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(await require('../services/feed-safety.service').previa(exigirUuid(req.params.id, 'portal')));
+}));
+router.post('/portais/:id/feed/aprovar', asyncHandler(async (req, res) => {
+  res.json(await require('../services/feed-safety.service').aprovar(exigirUuid(req.params.id, 'portal'), req.body, req.user));
+}));
+// Mapeia o código original do integrador antigo. Não usa external_id, que
+// pode conter o ID interno do portal, diferente do ListingID do XML.
+router.put('/portais/:id/feed/codigos', asyncHandler(async (req, res) => {
+  const { badRequest, conflict } = require('../utils/http-error');
+  const pool = require('../config/db');
+  const portalId = exigirUuid(req.params.id, 'portal');
+  const itens = req.body.itens;
+  if (!Array.isArray(itens) || !itens.length || itens.length > 10000) throw badRequest('Informe a lista de imóveis e códigos originais.');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const pi = (await client.query('SELECT feed_versao_id FROM portal_integracoes WHERE portal_id=$1 AND filial_id IS NULL FOR UPDATE', [portalId])).rows[0];
+    if (!pi || pi.feed_versao_id) throw conflict('Mapeamento permitido antes da primeira aprovação do feed.');
+    for (const item of itens) {
+      const imovelId = exigirUuid(item.imovelId, 'imóvel');
+      if (typeof item.listingId !== 'string' || !/^[^<>\x00-\x1f]{1,50}$/.test(item.listingId) || item.listingId.trim() !== item.listingId) throw badRequest('ListingID inválido.');
+      const r = await client.query('UPDATE imovel_portais SET listing_id_exportacao=$3 WHERE portal_id=$1 AND imovel_id=$2 RETURNING id', [portalId, imovelId, item.listingId]);
+      if (!r.rowCount) throw badRequest('Selecione o imóvel para o portal antes de mapear seu código.');
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, total: itens.length });
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}));
+
 /**
  * Central de integrações.
  * Configuração de portal é operação de gestão: admin e gerente.

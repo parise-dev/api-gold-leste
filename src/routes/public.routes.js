@@ -464,8 +464,12 @@ router.post(
     const portalSlug = limparTexto(req.params.portalSlug, 40);
     const token = limparTexto(req.params.token, 80);
 
+    if (portalSlug === 'grupo-olx' && !require('../integrations/portals/grupo-olx/webhook-auth').autorizado(req.headers.authorization)) {
+      return res.status(401).json({ message: 'Emissor do webhook não autorizado.' });
+    }
+
     const portaisRepo = require('../repositories/portais.repository');
-    const integracao = await portaisRepo.buscarIntegracaoPorToken(token);
+    const integracao = await portaisRepo.buscarIntegracaoPorWebhookToken(token);
 
     if (!integracao || integracao.portal_slug !== portalSlug) {
       throw notFound('Endpoint não encontrado.');

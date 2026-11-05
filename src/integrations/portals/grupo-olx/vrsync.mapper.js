@@ -134,6 +134,10 @@ function validar({ imovel, midias = [], integracao }) {
 
   const titulo = String(imovel.titulo || '').trim();
 
+  if (!imovel.codigo || String(imovel.codigo).length > 50) erros.push({ campo: 'codigo', mensagem: 'ListingID deve ter entre 1 e 50 caracteres.' });
+  if (/<[^>]+>/.test(titulo)) erros.push({ campo: 'titulo', mensagem: 'Title não pode conter HTML.' });
+  if (!/^\d{8}$/.test(String(imovel.cep || '').replace(/\D/g, ''))) erros.push({ campo: 'cep', mensagem: 'PostalCode válido é obrigatório.' });
+
   if (titulo.length < 10 || titulo.length > 100) {
     erros.push({
       campo: 'titulo',
@@ -196,6 +200,10 @@ function validar({ imovel, midias = [], integracao }) {
 
   const imagens = midias.filter((midia) => midia.tipo === 'IMAGEM' && midia.publica);
 
+  if (imagens.some(m => !/^https?:\/\//i.test(String(m.url || '')))) {
+    erros.push({ campo: 'midias', mensagem: 'Fotos precisam de URL pública HTTP/HTTPS.' });
+  }
+
   if (imagens.length < 5) {
     erros.push({
       campo: 'midias',
@@ -241,8 +249,8 @@ function validar({ imovel, midias = [], integracao }) {
 function montarLocation(imovel, indent) {
   const linhas = [];
 
-  linhas.push(tag('Country', 'BR', { indent, obrigatoria: true }));
-  linhas.push(tag('State', imovel.uf, { indent, obrigatoria: true }));
+  linhas.push(tag('Country', 'Brasil', { indent, attrs: { abbreviation: 'BR' }, obrigatoria: true }));
+  linhas.push(tag('State', imovel.uf, { indent, attrs: { abbreviation: imovel.uf }, obrigatoria: true }));
   linhas.push(tag('City', imovel.cidade, { indent, obrigatoria: true }));
   linhas.push(tag('Neighborhood', imovel.bairro, { indent, obrigatoria: true }));
 

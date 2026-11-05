@@ -400,6 +400,7 @@ async function leadsPendentes(limite = 25, client = pool) {
     FROM portal_leads pl
     LEFT JOIN imoveis i ON i.id = pl.imovel_id
     WHERE pl.responsavel_id IS NULL
+      AND COALESCE((to_jsonb(pl)->>'operacao_gerenciada')::boolean, FALSE)=FALSE
       AND pl.distribuicao_pendente_desde IS NOT NULL
       AND pl.status_processamento NOT IN ('DESCARTADO', 'DUPLICADO')
     ORDER BY pl.distribuicao_pendente_desde ASC
@@ -417,6 +418,7 @@ async function contarPendentes(client = pool) {
     SELECT COUNT(*)::int AS total
     FROM portal_leads
     WHERE responsavel_id IS NULL
+      AND COALESCE((to_jsonb(portal_leads)->>'operacao_gerenciada')::boolean, FALSE)=FALSE
       AND distribuicao_pendente_desde IS NOT NULL
       AND status_processamento NOT IN ('DESCARTADO', 'DUPLICADO')
     `

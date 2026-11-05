@@ -7,13 +7,14 @@ const { HttpError } = require('../utils/http-error');
  */
 // eslint-disable-next-line no-unused-vars
 function errorMiddleware(error, req, res, next) {
+  const caminhoLog = String(req.path || '').replace(/(\/public\/(?:feeds|leads)\/[^/]+\/)[^/]+/, '$1[protegido]');
   if (res.headersSent) {
     return next(error);
   }
 
   if (error instanceof HttpError) {
     if (error.status >= 500) {
-      console.error(`[${req.method} ${req.originalUrl}]`, error);
+      console.error(`[${req.method} ${caminhoLog}]`, error.message);
     }
 
     return res.status(error.status).json({
@@ -21,6 +22,9 @@ function errorMiddleware(error, req, res, next) {
       detalhes: error.detalhes || undefined
     });
   }
+
+  if (error?.type === 'entity.parse.failed') return res.status(400).json({ message: 'JSON inválido.' });
+  if (error?.type === 'entity.too.large') return res.status(413).json({ message: 'Corpo da requisição acima do limite.' });
 
   // Erros conhecidos do multer (upload)
   if (error && error.name === 'MulterError') {
@@ -54,18 +58,18 @@ function errorMiddleware(error, req, res, next) {
 
     if (mapeado) {
       if (mapeado.status >= 500) {
-        console.error(`[${req.method} ${req.originalUrl}]`, error);
+        console.error(`[${req.method} ${caminhoLog}]`, error.code);
       }
 
       return res.status(mapeado.status).json({
         message: mapeado.message,
         codigo: error.code,
-        detalhe: error.detail || undefined
+        detalhe: undefined
       });
     }
   }
 
-  console.error(`[${req.method} ${req.originalUrl}] Erro não tratado:`, error);
+  console.error(`[${req.method} ${caminhoLog}] Erro não tratado:`, error.code || error.name);
 
   return res.status(500).json({
     message: 'Erro interno ao processar a requisição.'

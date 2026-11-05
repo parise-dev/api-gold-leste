@@ -31,6 +31,7 @@ const LOCK_SQL = 'SELECT pg_advisory_xact_lock($1)';
  * Se o corretor acabou de entrar online, tenta escoar leads pendentes.
  */
 async function registrarPresenca(usuario) {
+  if (require('./operacao/entrada').ativo()) return { naFila:false, entrouNaFila:false, exigeLocalizacao:true, leadsPendentesDistribuidos:0 };
   if (!(await filaRepo.filaDisponivel())) {
     return { naFila: false, entrouNaFila: false, leadsPendentesDistribuidos: 0, indisponivel: true };
   }
@@ -91,6 +92,13 @@ async function marcarPendente(leadId, client) {
  * @returns {Promise<{atribuido: boolean, lead: object|null, corretor: object|null, motivo: string}>}
  */
 async function distribuirLead(leadId, { tipo = 'AUTOMATICA', motivo = null } = {}) {
+  if (require('./operacao/entrada').ativo()) {
+    const l=(await pool.query('SELECT * FROM portal_leads WHERE id=$1',[leadId])).rows[0];
+    if (!l) return { atribuido:false, motivo:'LEAD_INEXISTENTE' };
+    if (!l.operacao_gerenciada) return { atribuido:false, motivo:'LEAD_LEGADO_PRESERVADO', lead:l };
+    const lista=await require('./operacao/fila').distribuir();
+    return lista.find(r=>r.lead.id===leadId)||{atribuido:false,motivo:'SEM_CORRETOR_ELEGIVEL',lead:l};
+  }
   if (!(await filaRepo.filaDisponivel())) {
     return { atribuido: false, lead: null, corretor: null, motivo: 'FILA_INDISPONIVEL' };
   }
@@ -112,6 +120,8 @@ async function distribuirLead(leadId, { tipo = 'AUTOMATICA', motivo = null } = {
     }
 
     const lead = leadResult.rows[0];
+    if(lead.operacao_gerenciada){await client.query('ROLLBACK');return {atribuido:false,lead,motivo:'OPERACAO_PAUSADA'};}
+
 
     // Já tem dono: nada a fazer. Protege contra corrida entre a
     // distribuição automática e uma atribuição manual simultânea.
@@ -210,6 +220,7 @@ async function distribuirLead(leadId, { tipo = 'AUTOMATICA', motivo = null } = {
  * online, não adianta tentar os demais.
  */
 async function distribuirPendentes({ limite = config.MAX_PENDENTES_POR_RODADA } = {}) {
+  if (require('./operacao/entrada').ativo()) return require('./operacao/fila').distribuir();
   if (!(await filaRepo.filaDisponivel())) return [];
 
   const pendentes = await filaRepo.leadsPendentes(limite);
@@ -241,6 +252,7 @@ async function distribuirPendentes({ limite = config.MAX_PENDENTES_POR_RODADA } 
  * com o usuário que fez a alteração.
  */
 async function atribuirManual({ leadId, usuarioId, usuario, motivo = null }) {
+  if (require('./operacao/entrada').ativo()) throw badRequest('A atribuição operacional exige a fila por filial, localização e notificação. Use o kanban operacional.');
   if (!(await filaRepo.filaDisponivel())) {
     throw badRequest(
       'Fila de leads indisponível: execute sql/20260830_fila_leads.sql no banco para habilitar.'
@@ -264,6 +276,8 @@ async function atribuirManual({ leadId, usuarioId, usuario, motivo = null }) {
     }
 
     const lead = leadResult.rows[0];
+    if(lead.operacao_gerenciada)throw badRequest('Lead operacional protegido; use a fila e o kanban.');
+
 
     const destinoResult = await client.query(
       `SELECT id, nome, perfil, ativo, filial_id FROM usuarios WHERE id = $1 LIMIT 1`,

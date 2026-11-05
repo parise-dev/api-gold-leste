@@ -4,13 +4,11 @@ const mapper = require('./vrsync.mapper');
 /**
  * Grupo OLX — ZAP Imóveis / Viva Real.
  *
- * Modo oficial suportado: feed XML VRSync publicado em URL pública, que
- * o portal processa a cada 12h. A URL do feed é cadastrada pelo cliente
- * no Canal Pro / junto ao portal.
+ * Feed XML VRSync em URL pública cadastrada no Canal Pro. O prazo de
+ * processamento depende da configuração e do relatório do portal.
  *
- * Não existe, na documentação pública, endpoint de publicação unitária
- * nem de importação de leads — por isso publish/importLeads permanecem
- * como não suportados em vez de "simulados".
+ * Leads recebidos pelo webhook oficial. Publicação unitária e consulta
+ * de status remoto continuam indisponíveis neste adapter.
  */
 class GrupoOlxAdapter extends PortalAdapter {
   constructor() {
@@ -22,7 +20,7 @@ class GrupoOlxAdapter extends PortalAdapter {
       documentacaoUrl: 'https://developers.grupozap.com/feeds/xml-formats/',
       pendencias: [
         'Cadastrar a URL do feed gerado por esta API junto ao Grupo OLX (Canal Pro).',
-        'Leads do portal chegam pelo Canal Pro; não há API pública de importação documentada.'
+        'Homologar o webhook de leads no Canal Pro, preservando o recebimento atual durante os testes.'
       ]
     });
   }
@@ -34,7 +32,7 @@ class GrupoOlxAdapter extends PortalAdapter {
       update: false,
       deactivate: false,
       publicationStatus: false,
-      importLeads: false,
+      importLeads: true,
       testConnection: true
     };
   }

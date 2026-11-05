@@ -9,6 +9,7 @@ async function listarPortais() {
       pi.status               AS integracao_status,
       pi.feed_habilitado,
       pi.feed_token,
+      to_jsonb(pi)->>'webhook_token' AS webhook_token,
       pi.contato_nome, pi.contato_email, pi.contato_telefone, pi.contato_site,
       pi.contato_logo_url, pi.contato_cidade, pi.contato_uf, pi.contato_bairro,
       pi.contato_endereco, pi.contato_cep,
@@ -70,6 +71,12 @@ async function buscarIntegracaoPorToken(token) {
   );
 
   return result.rows[0] || null;
+}
+
+async function buscarIntegracaoPorWebhookToken(token) {
+  const r = await pool.query(`SELECT pi.*, p.slug AS portal_slug FROM portal_integracoes pi
+    JOIN portais p ON p.id=pi.portal_id WHERE pi.feed_token=$1 OR to_jsonb(pi)->>'webhook_token'=$1 LIMIT 1`, [token]);
+  return r.rows[0] || null;
 }
 
 async function salvarIntegracao(portalId, dados, client = pool) {
@@ -167,7 +174,7 @@ async function salvarVinculoImovelPortal(imovelId, portalId, dados, client = poo
  * Filtra na origem tudo que o portal não deve receber: inativos,
  * vendidos, alugados, suspensos e não habilitados para o canal.
  */
-async function listarImoveisDoFeed(portalId, limite = 5000) {
+async function listarImoveisDoFeed(portalId) {
   const result = await pool.query(
     `
     SELECT i.*, ip.tipo_publicacao, ip.id AS vinculo_id
@@ -178,9 +185,8 @@ async function listarImoveisDoFeed(portalId, limite = 5000) {
       AND ip.habilitado = TRUE
       AND i.status NOT IN ('VENDIDO', 'ALUGADO', 'SUSPENSO', 'INATIVO')
     ORDER BY i.updated_at DESC
-    LIMIT $2
     `,
-    [portalId, limite]
+    [portalId]
   );
 
   return result.rows;
@@ -291,6 +297,7 @@ module.exports = {
   buscarPortalPorSlug,
   buscarIntegracao,
   buscarIntegracaoPorToken,
+  buscarIntegracaoPorWebhookToken,
   salvarIntegracao,
   listarPortaisDoImovel,
   salvarVinculoImovelPortal,

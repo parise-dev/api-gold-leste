@@ -38,7 +38,7 @@ router.get(
     const resultado = await portaisService.gerarFeed({ portalSlug, token });
 
     res.setHeader('Content-Type', resultado.contentType);
-    res.setHeader('Cache-Control', 'public, max-age=600');
+    res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Total-Anuncios', String(resultado.totalAnuncios));
 
     res.send(resultado.conteudo);

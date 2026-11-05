@@ -40,6 +40,7 @@ function mapearPortal(row) {
       habilitado: !!row.integracao_habilitada,
       status: row.integracao_status || 'PENDING_CONFIGURATION',
       feedHabilitado: !!row.feed_habilitado,
+      webhookUrl: (row.webhook_token || row.feed_token) ? `${baseUrlPublica()}/public/leads/${row.slug}/${row.webhook_token || row.feed_token}` : null,
       feedUrl: row.feed_habilitado ? montarUrlFeed(row.slug, row.feed_token) : null,
       possuiToken: !!row.feed_token,
       contatoNome: row.contato_nome,
@@ -122,6 +123,16 @@ async function salvarConfiguracao({ portalId, body, usuario }) {
 
   // Token do feed: gerado quando o feed é habilitado, ou sob pedido.
   const integracaoAtual = await portaisRepo.buscarIntegracao(portalId);
+
+  // Migração aditiva opcional: manter URL anterior válida, mas separar novos
+  // webhooks do token do XML. Sem migração, o contrato legado continua igual.
+  if (integracaoAtual && Object.prototype.hasOwnProperty.call(integracaoAtual, 'webhook_token') && !integracaoAtual.webhook_token) {
+    dados.webhook_token = gerarToken(24);
+  }
+
+  if (integracaoAtual?.feed_versao_id && (body.regenerarToken === true || dados.habilitado === false || dados.feed_habilitado === false)) {
+    throw new HttpError(409, 'Feed aprovado protegido: não é permitido desativar ou trocar seu token durante a homologação.');
+  }
 
   const precisaToken =
     (dados.feed_habilitado || integracaoAtual?.feed_habilitado) &&
@@ -446,73 +457,18 @@ async function gerarFeed({ portalSlug, token }) {
     );
   }
 
-  const inicio = Date.now();
+  const seguranca = require('./feed-safety.service');
+  const aprovado = await seguranca.obterAprovado(integracao);
+  if (aprovado) return aprovado;
 
-  const imoveis = await portaisRepo.listarImoveisDoFeed(integracao.portal_id);
-  const ids = imoveis.map((imovel) => imovel.id);
-
-  const midiasPorImovel = await portaisRepo.midiasDosImoveis(ids);
-  const caracteristicasPorImovel = await portaisRepo.caracteristicasDosImoveis(ids);
-
-  const itens = [];
-  const rejeitados = [];
-
-  for (const imovel of imoveis) {
-    const contexto = {
-      imovel,
-      midias: midiasPorImovel.get(imovel.id) || [],
-      caracteristicas: caracteristicasPorImovel.get(imovel.id) || [],
-      integracao,
-      tipoPublicacao: imovel.tipo_publicacao
-    };
-
-    const validacao = adapter.validateProperty(contexto);
-
-    if (!validacao.ok) {
-      // Imóvel inválido NÃO entra no feed — e o motivo fica registrado.
-      rejeitados.push({ codigo: imovel.codigo, erros: validacao.erros });
-
-      await portaisRepo.salvarVinculoImovelPortal(imovel.id, integracao.portal_id, {
-        status: 'INVALIDO',
-        erros: JSON.stringify(validacao.erros),
-        ultima_validacao_em: new Date(),
-        ultimo_erro: validacao.erros.map((erro) => erro.mensagem).join(' | ').slice(0, 4000)
-      });
-
-      continue;
-    }
-
-    itens.push(contexto);
-
-    await portaisRepo.salvarVinculoImovelPortal(imovel.id, integracao.portal_id, {
-      status: 'PUBLICADO',
-      erros: JSON.stringify([]),
-      ultimo_erro: null,
-      ultima_validacao_em: new Date(),
-      ultima_sincronizacao: new Date()
-    });
+  // Compatibilidade com feeds anteriores: mesmo endpoint e token. Nunca
+  // devolver uma carteira parcial/vazia nem alterar status pelo simples GET.
+  const previa = await seguranca.previa(integracao.portal_id);
+  if (!previa.xml || previa.rejeitados.length || previa.duplicados.length) {
+    throw new HttpError(503, 'Feed bloqueado para evitar retirada acidental de anúncios. Revise a prévia e aprove uma versão completa.',
+      { rejeitados: previa.rejeitados, duplicados: previa.duplicados });
   }
-
-  const resultado = await adapter.generateFeed({ integracao, itens });
-
-  await portaisRepo.salvarIntegracao(integracao.portal_id, {
-    ultima_sincronizacao: new Date(),
-    ultimo_erro: rejeitados.length
-      ? `${rejeitados.length} imóvel(is) fora do feed por pendência de validação.`
-      : null
-  });
-
-  await portaisRepo.registrarLog({
-    portalId: integracao.portal_id,
-    portalSlug,
-    operacao: 'FEED',
-    status: rejeitados.length ? 'AVISO' : 'OK',
-    mensagem: `Feed gerado com ${itens.length} anúncio(s). ${rejeitados.length} rejeitado(s).`,
-    duracaoMs: Date.now() - inicio,
-    detalhes: sanitizarPayload({ rejeitados: rejeitados.slice(0, 50) })
-  });
-
-  return resultado;
+  return { ok: true, conteudo: previa.xml, contentType: 'application/xml; charset=utf-8', totalAnuncios: previa.totalAnuncios };
 }
 
 async function listarLogs(portalId, opcoes) {

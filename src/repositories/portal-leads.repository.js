@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 
 async function inserir(dados, client = pool) {
+  dados = await require('../services/operacao/entrada').preparar(dados, client);
   const colunas = Object.keys(dados);
   const valores = colunas.map((coluna) => dados[coluna]);
   const placeholders = colunas.map((_, indice) => `$${indice + 1}`);
@@ -25,33 +26,17 @@ async function inserirIdempotente(dados, client = pool) {
   if (!dados.external_lead_id || !dados.portal_slug) {
     return { lead: await inserir(dados, client), duplicado: false };
   }
+  dados = await require('../services/operacao/entrada').preparar(dados, client);
 
-  const existente = await client.query(
-    `SELECT * FROM portal_leads WHERE portal_slug = $1 AND external_lead_id = $2 LIMIT 1`,
-    [dados.portal_slug, dados.external_lead_id]
-  );
-
-  if (existente.rows.length) {
-    return { lead: existente.rows[0], duplicado: true };
-  }
-
-  try {
-    return { lead: await inserir(dados, client), duplicado: false };
-  } catch (error) {
-    // Corrida entre dois retries simultâneos: o índice único resolve.
-    if (error.code === '23505') {
-      const recuperado = await client.query(
-        `SELECT * FROM portal_leads WHERE portal_slug = $1 AND external_lead_id = $2 LIMIT 1`,
-        [dados.portal_slug, dados.external_lead_id]
-      );
-
-      if (recuperado.rows.length) {
-        return { lead: recuperado.rows[0], duplicado: true };
-      }
-    }
-
-    throw error;
-  }
+  const colunas = Object.keys(dados);
+  const r = await client.query(`INSERT INTO portal_leads (${colunas.join(', ')})
+    VALUES (${colunas.map((_, i) => '$' + (i + 1)).join(', ')})
+    ON CONFLICT (portal_slug, external_lead_id) WHERE external_lead_id IS NOT NULL
+    DO NOTHING RETURNING *`, colunas.map(c => dados[c]));
+  if (r.rows.length) return { lead: r.rows[0], duplicado: false };
+  const existente = await client.query('SELECT * FROM portal_leads WHERE portal_slug=$1 AND external_lead_id=$2',
+    [dados.portal_slug, dados.external_lead_id]);
+  return { lead: existente.rows[0], duplicado: true };
 }
 
 async function listar({ filtros = {}, page, pageSize, offset, usuario }) {

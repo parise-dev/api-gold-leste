@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "main": "src/server.js",
   "scripts": {
+    "test": "node --test tests/integracoes.test.js tests/operacao.test.js",
+    "integracoes:diagnostico": "node scripts/diagnostico-integracoes.js",
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
     "migrate:cliente": "node scripts/migrate-ajustes-cliente.js",
@@ -23,6 +25,7 @@
     "sharp": "^0.35.3"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.13",
     "nodemon": "^3.1.9"
   }
 }

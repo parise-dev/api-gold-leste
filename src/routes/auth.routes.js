@@ -2,7 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
-const { authMiddleware } = require('../middlewares/auth.middleware');
+const { authMiddleware, somentePerfis } = require('../middlewares/auth.middleware');
 const distribuicao = require('../services/lead-distribution.service');
 
 const router = express.Router();
@@ -253,7 +253,8 @@ router.post('/logout', authMiddleware, async (req, res) => {
   return res.json({ message: 'Sessão encerrada.' });
 });
 
-router.post('/seed-admin', async (req, res) => {
+// A criação/recuperação do administrador não pode ficar exposta sem autenticação.
+router.post('/seed-admin', authMiddleware, somentePerfis('admin'), async (req, res) => {
   try {
     const senhaHash = await bcrypt.hash(SENHA_PADRAO, 10);
 

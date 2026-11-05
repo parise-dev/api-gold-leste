@@ -30,6 +30,10 @@ async function authMiddleware(req, res, next) {
     }
 
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.sid) {
+      const sessao = await pool.query('SELECT id FROM gl_sessoes WHERE id=$1 AND usuario_id=$2 AND revogada_em IS NULL AND expira_em>now()', [decoded.sid,decoded.id]);
+      if (!sessao.rows.length) return res.status(401).json({ message:'Sessão encerrada. Entre novamente.' });
+    }
 
     const result = await pool.query(
       `
@@ -72,6 +76,7 @@ async function authMiddleware(req, res, next) {
       perfil: usuario.perfil,
       filialId: usuario.filial_id || null,
       gerenteId: usuario.gerente_id || null
+      ,sessaoId: decoded.sid || null
     };
 
     next();

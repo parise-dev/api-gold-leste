@@ -70,6 +70,8 @@ function definirResponsavel(imovel) {
  * IMOVEL: comportamento anterior à fila, preservado por configuração.
  */
 async function responsavelInicial(imovel) {
+  if (require('./operacao/entrada').ativo()) return { responsavelId: null, filialId: imovel?.filial_id || null,
+    colunasDistribuicao: { distribuicao_pendente_desde: new Date(), distribuicao_tipo: null } };
   // Enquanto sql/20260830_fila_leads.sql não for executado, as colunas de
   // distribuição não existem: o lead é gravado exatamente como antes.
   const filaAtiva = filaConfig.ESTRATEGIA === 'FILA' && (await filaRepo.filaDisponivel());
@@ -105,6 +107,11 @@ async function responsavelInicial(imovel) {
  * distribuído na próxima rodada (heartbeat de corretor ou ação do gestor).
  */
 async function distribuirAposCadastro(lead) {
+  if (lead?.operacao_gerenciada) {
+    try { await require('./operacao/fila').distribuir();
+      return (await pool.query('SELECT * FROM portal_leads WHERE id=$1',[lead.id])).rows[0] || lead;
+    } catch (_) { console.error('[operacao] Lead preservado; aguardando distribuição.'); return lead; }
+  }
   if (filaConfig.ESTRATEGIA !== 'FILA' || !lead || lead.responsavel_id) return lead;
   if (!(await filaRepo.filaDisponivel())) return lead;
 
@@ -135,6 +142,7 @@ async function registrarInteressePublico({ imovel, body, req }) {
   const utms = extrairUtms(body);
 
   const client = await pool.connect();
+  let liberado=false;
 
   try {
     await client.query('BEGIN');
@@ -164,6 +172,7 @@ async function registrarInteressePublico({ imovel, body, req }) {
     await imoveisRepo.recontarLeads(imovel.id, client);
 
     await client.query('COMMIT');
+    client.release(); liberado=true;
 
     // Fora da transação: o lead já está salvo. A fila é atômica por si.
     return await distribuirAposCadastro(lead);
@@ -171,7 +180,7 @@ async function registrarInteressePublico({ imovel, body, req }) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
-    client.release();
+    if(!liberado) client.release();
   }
 }
 
@@ -216,6 +225,7 @@ async function registrarContatoPublico({ body, req }) {
   const origem = limparTexto(body.origem, 30) === 'LANDING' ? 'LANDING' : 'SITE';
 
   const client = await pool.connect();
+  let liberado=false;
 
   try {
     await client.query('BEGIN');
@@ -247,13 +257,14 @@ async function registrarContatoPublico({ body, req }) {
     }
 
     await client.query('COMMIT');
+    client.release(); liberado=true;
 
     return await distribuirAposCadastro(lead);
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
-    client.release();
+    if(!liberado) client.release();
   }
 }
 
@@ -306,6 +317,9 @@ async function registrarCaptacaoImovel({ body, req }) {
  * Idempotente por (portal_slug, external_lead_id).
  */
 async function registrarLeadDePortal({ portalSlug, body, req }) {
+  if (portalSlug === 'grupo-olx') {
+    body = require('../integrations/portals/grupo-olx/lead.mapper').normalizarLead(body);
+  }
   const portal = await portaisRepo.buscarPortalPorSlug(portalSlug);
 
   const externalListingId = limparTexto(
@@ -320,10 +334,12 @@ async function registrarLeadDePortal({ portalSlug, body, req }) {
       `
       SELECT * FROM imoveis
       WHERE deleted_at IS NULL
-        AND (LOWER(codigo) = LOWER($1) OR LOWER(referencia_externa) = LOWER($1))
+        AND (LOWER(codigo) = LOWER($1) OR LOWER(referencia_externa) = LOWER($1)
+          OR EXISTS (SELECT 1 FROM imovel_portais ip JOIN portais p ON p.id=ip.portal_id
+            WHERE ip.imovel_id=imoveis.id AND p.slug=$2 AND to_jsonb(ip)->>'listing_id_exportacao'=$1))
       LIMIT 1
       `,
-      [externalListingId]
+      [externalListingId, portalSlug]
     );
 
     imovel = busca.rows[0] || null;
@@ -352,53 +368,43 @@ async function registrarLeadDePortal({ portalSlug, body, req }) {
     filial_id: filialId,
     atribuido_em: responsavelId ? new Date() : null,
     ...colunasDistribuicao,
-    erro_processamento: imovel
+    erro_processamento: imovel || body.contatoGeral
       ? null
       : `Imóvel não localizado para o identificador externo "${externalListingId || 'não informado'}".`
   };
 
   const client = await pool.connect();
-
+  let lead, duplicado;
   try {
     await client.query('BEGIN');
-
-    const { lead, duplicado } = await leadsRepo.inserirIdempotente(dados, client);
-
-    if (!duplicado && imovel) {
-      await imoveisRepo.recontarLeads(imovel.id, client);
-    }
-
-    await client.query('COMMIT');
-
+    ({ lead, duplicado } = await leadsRepo.inserirIdempotente(dados, client));
+    if (!duplicado && imovel) await imoveisRepo.recontarLeads(imovel.id, client);
     await portaisRepo.registrarLog({
-      portalId: portal?.id || null,
-      portalSlug,
-      imovelId: imovel?.id || null,
-      operacao: 'IMPORT_LEADS',
-      status: duplicado ? 'IGNORADO' : (imovel ? 'OK' : 'AVISO'),
-      mensagem: duplicado
-        ? 'Lead já registrado anteriormente (idempotência).'
-        : imovel
-          ? 'Lead recebido e vinculado ao imóvel.'
-          : 'Lead recebido sem imóvel correspondente.',
-      externalId: dados.external_lead_id,
-      detalhes: sanitizarPayload(body)
-    });
-
-    // Duplicado não é redistribuído: o lead original já tem dono.
-    const final = duplicado ? lead : await distribuirAposCadastro(lead);
-
-    return { lead: final, duplicado };
+      portalId: portal?.id || null, portalSlug, imovelId: imovel?.id || null,
+      operacao: 'IMPORT_LEADS', status: duplicado ? 'IGNORADO' : (imovel || body.contatoGeral ? 'OK' : 'AVISO'),
+      mensagem: duplicado ? 'Lead já registrado anteriormente (idempotência).' : 'Lead recebido e persistido.',
+      externalId: dados.external_lead_id, detalhes: sanitizarPayload(body)
+    }, client);
+    await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
+  // Libera a conexão antes de acionar o rodízio. O lead e seu log já
+  // estão confirmados; uma indisponibilidade da fila não perde o contato.
+  const final = duplicado ? lead : await distribuirAposCadastro(lead);
+  return { lead: final, duplicado };
 }
 
 /** Marca o primeiro atendimento — base para SLA futuro. */
 async function marcarPrimeiroAtendimento(leadId, usuario) {
+  const atual=(await pool.query('SELECT * FROM portal_leads WHERE id=$1',[leadId])).rows[0];
+  if(atual?.operacao_gerenciada){
+    if(!atual.responsavel_id)throw badRequest('Este lead deve ser atribuído pela fila antes do atendimento.');
+    await require('./operacao/fila').editar(leadId,{etapa:atual.etapa==='NOVO'?'EM_ATENDIMENTO':atual.etapa,
+      descricao:'Primeiro atendimento registrado pelo painel.',versao:atual.versao_atendimento},usuario);
+    return (await pool.query('SELECT * FROM portal_leads WHERE id=$1',[leadId])).rows[0];
+  }
   // A coluna de distribuição só existe depois da migration da fila.
   const limparPendencia = (await filaRepo.filaDisponivel())
     ? 'distribuicao_pendente_desde = NULL,'
