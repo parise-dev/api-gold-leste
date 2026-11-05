@@ -18,7 +18,7 @@ router.post('/login',rateLimit({windowMs:600000,limit:20}),a(async(req,res)=>{
  res.json({token:jwt.sign({id:u.id,sid},process.env.JWT_SECRET,{expiresIn:'30d'}),usuario:{id:u.id,nome:u.nome,email:u.email,perfil:u.perfil,filialId:u.filial_id,fotoUrl:u.foto_url}});
 }));
 router.use(authMiddleware);
-router.get('/capacidades',(req,res)=>res.json({habilitado:require('../services/operacao/entrada').ativo()}));
+router.get('/capacidades',(req,res)=>res.json({habilitado:require('../services/operacao/entrada').appAtivo()}));
 router.use((req,res,next)=>{res.setHeader('Cache-Control','no-store');next();});
 router.get('/estado',a(async(req,res)=>{
  fila.exigirAtivo();const u=(await pool.query('SELECT foto_url FROM usuarios WHERE id=$1',[req.user.id])).rows[0];

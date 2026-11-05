@@ -1,10 +1,10 @@
 const pool=require('../../config/db');
-const {ativo}=require('./entrada');
+const {ativo,appAtivo}=require('./entrada');
 const {coordenadas,distanciaM,prazo,ETAPAS}=require('./regras');
 const {badRequest,forbidden,notFound,HttpError}=require('../../utils/http-error');
 const LOCK=6301030;
 async function transacao(fn){ const c=await pool.connect();try{await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock($1)',[LOCK]);const r=await fn(c);await c.query('COMMIT');return r;}catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();} }
-function exigirAtivo(){if(!ativo())throw new HttpError(503,'Operação mobile ainda não habilitada no ambiente.');}
+function exigirAtivo(){if(!appAtivo())throw new HttpError(503,'Operação mobile ainda não habilitada no ambiente.');}
 const ELEGIVEIS=`SELECT m.*,u.nome,u.foto_url,f.nome AS filial_nome FROM gl_fila_membros m
  JOIN usuarios u ON u.id=m.usuario_id JOIN filiais f ON f.id=m.filial_id
  JOIN gl_sessoes s ON s.id=m.sessao_id
